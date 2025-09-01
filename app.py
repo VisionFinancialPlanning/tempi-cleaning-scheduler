@@ -9,7 +9,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta, time
+from datetime import datetime, time
 import pytz
 from pandas.api.types import is_datetime64_any_dtype as _is_dt
 
@@ -112,7 +112,7 @@ def _fmt_tz(series, fmt):
         except Exception: return pd.Series([""]*len(series))
 
 def _parse_money(val):
-    """Convierte montos tipo '$1,234.50', '1.234,50', 'USD 200' → float."""
+    """Convierte montos ('$1,234.50', '1.234,50', 'USD 200', 200) → float."""
     if val is None or (isinstance(val, float) and np.isnan(val)): return np.nan
     if isinstance(val, (int, float)): return float(val)
     s = str(val)
@@ -129,7 +129,7 @@ def _parse_money(val):
         return np.nan
 
 # ==============================
-# NORMALIZACIÓN
+# NORMALIZACIÓN (columnas flexibles)
 # ==============================
 def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Columnas mínimas: 'Check-In', 'Check-Out'. Horas y extras con alias flexibles."""
@@ -164,7 +164,7 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     if apt_col:   out["apartment"]  = df[apt_col].astype(str)
     if guest_col: out["guest_name"] = df[guest_col].astype(str)
 
-    # Extras solicitadas
+    # Extras solicitadas + canal/pago/montos
     map_optional = {
         "number_guests": ["NUMBER GUESTS","Guests","# Guests","Numero Huespedes","Nº Huespedes"],
         "sofa_or_bed":   ["SOFA OR BED","Sofa Bed","Sofa cama","Sofacama","Sofa as Bed"],
@@ -174,7 +174,6 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
         "parking":       ["PARKING","Estacionamiento","Parking Spot"],
         "nombre":        ["Nombre","Name","Guest Name"],
         "notes":         ["NOTES","Notas","Observaciones"],
-        # Canal / pago / montos
         "channel":       ["Channel","Source","Booking Source","OTA","Origin","Website","Portal","Booked Via"],
         "payment_method":["Payment Method","Payment","Método de Pago","Forma de pago","Payment Type","Pay Method"],
         "amount_due":    ["Amount Due","Balance Due","Balance","Total Due","Pending Amount","Por cobrar","A Cobrar","Saldo","Saldo pendiente","Total Pendiente"],
@@ -213,7 +212,6 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
         if any(w in pm for w in ["cash","efectivo"]): reason.append("pago=cash")
         if any(w in nt for w in ["cash","efectivo"]): reason.append("nota menciona cash")
         needs = len(reason) > 0
-        # Monto a cobrar
         amt = _parse_money(row.get("amount_due", np.nan))
         if np.isnan(amt):
             amt = _parse_money(row.get("total_price", np.nan))
@@ -229,7 +227,6 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
         out["cash_reason"] = []
         out["cash_amount"] = []
 
-    # Orden amigable
     preferred = [
         "apartment","guest_name","number_guests","sofa_or_bed","reservation_id",
         "transporte","extra","parking","nombre","notes",
@@ -243,7 +240,7 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out[cols]
 
 # ==============================
-# SCHEDULER & DISPONIBILIDAD
+# UTILIDADES DE DÍA
 # ==============================
 def to_tz(series: pd.Series) -> pd.Series:
     s = pd.to_datetime(series, errors="coerce")
@@ -260,37 +257,6 @@ def filter_day(df: pd.DataFrame, day) -> pd.DataFrame:
     mask = df["checkout"].between(start, end, inclusive="left") | df["checkin"].between(start, end, inclusive="left")
     return df[mask].copy()
 
-def infer_duration(row, default_duration, cfg):
-    if "clean_duration_minutes" in row and pd.notna(row["clean_duration_minutes"]):
-        return int(row["clean_duration_minutes"])
-    if cfg is not None and not cfg.empty and "apartment" in cfg.columns:
-        apt_name = str(row.get("apartment","")).strip().lower()
-        hit = cfg[cfg["apartment"].astype(str).str.lower() == apt_name]
-        if not hit.empty: return int(hit.iloc[0].get("base_minutes", default_duration))
-    return default_duration
-
-def build_cleaning_jobs(day_df: pd.DataFrame, day, default_duration: int, cfg: pd.DataFrame, mop_minutes: int,
-                        day_start_t: time, day_end_t: time) -> pd.DataFrame:
-    jobs = []
-    the_day = pd.Timestamp(day).date()
-    start_of_day = TZ.localize(datetime.combine(the_day, day_start_t))
-    for _, row in day_df.iterrows():
-        apt = row.get("apartment", "Apto"); unit = row.get("unit_id", ""); guest = row.get("guest_name", "")
-        checkout = row.get("checkout", pd.NaT); checkin  = row.get("checkin",  pd.NaT)
-        is_co = pd.notna(checkout) and checkout.date() == the_day
-        is_ci = pd.notna(checkin)  and checkin.date()  == the_day
-        if is_co and is_ci:
-            duration = infer_duration(row, default_duration, cfg); start_window = checkout; deadline = checkin
-        elif is_co:
-            duration = infer_duration(row, default_duration, cfg); start_window = checkout; deadline = pd.NaT
-        elif is_ci:
-            duration = int(mop_minutes); start_window = start_of_day; deadline = checkin
-        else:
-            continue
-        jobs.append({"apartment": apt, "unit_id": unit, "guest_name": guest,
-                     "start_window": start_window, "deadline": deadline, "duration_min": int(duration)})
-    return pd.DataFrame(jobs)
-
 def build_apartment_windows(day_df: pd.DataFrame, day, day_start_t: time, day_end_t: time) -> pd.DataFrame:
     the_day = pd.Timestamp(day).date()
     start_of_day = TZ.localize(datetime.combine(the_day, day_start_t))
@@ -301,11 +267,37 @@ def build_apartment_windows(day_df: pd.DataFrame, day, day_start_t: time, day_en
         is_ci = pd.notna(ci) and ci.date() == the_day; is_co = pd.notna(co) and co.date() == the_day
         if is_co and is_ci: rows.append({"apartment": apt, "start": co, "end": ci, "kind": "turnover"})
         elif is_co:        rows.append({"apartment": apt, "start": co, "end": end_of_day, "kind": "solo checkout"})
-        elif is_ci:        rows.append({"apartment": apt, "start": start_of_day, "end": ci, "kind": "solo check-in (mopa)"})
+        elif is_ci:        rows.append({"apartment": apt, "start": start_of_day, "end": ci, "kind": "solo check-in"})
     win = pd.DataFrame(rows)
     if not win.empty: win = win[win["end"] > win["start"]]
     return win
 
+def day_summary(day_df: pd.DataFrame, day) -> pd.DataFrame:
+    """Resumen por apartamento (día): Turnover, Solo Check-Out, Solo Check-In + horas/horas gap."""
+    the_day = pd.Timestamp(day).date()
+    rows = []
+    for _, r in day_df.iterrows():
+        apt = r.get("apartment","Apto")
+        ci  = r.get("checkin", pd.NaT)
+        co  = r.get("checkout", pd.NaT)
+        is_ci = pd.notna(ci) and ci.date() == the_day
+        is_co = pd.notna(co) and co.date() == the_day
+
+        ci_str = ci.tz_convert(TZ_NAME).strftime("%H:%M") if is_ci else ""
+        co_str = co.tz_convert(TZ_NAME).strftime("%H:%M") if is_co else ""
+
+        if is_ci and is_co:
+            gap_hours = round((ci - co).total_seconds() / 3600.0, 2)
+            tipo = "Turnover"
+            rows.append({"apartment": apt, "tipo": tipo, "checkout_time": co_str, "checkin_time": ci_str, "gap_hours": gap_hours})
+        elif is_co:
+            rows.append({"apartment": apt, "tipo": "Solo Check-Out", "checkout_time": co_str, "checkin_time": "", "gap_hours": ""})
+        elif is_ci:
+            rows.append({"apartment": apt, "tipo": "Solo Check-In",  "checkout_time": "", "checkin_time": ci_str, "gap_hours": ""})
+
+    return pd.DataFrame(rows)
+
+# ============ Scheduler ============
 class EmployeeTimeline:
     def __init__(self, name, start_t: time, end_t: time, lunch_start: time, lunch_end: time, day):
         self.name = name; self.day = pd.Timestamp(day).date()
@@ -327,6 +319,37 @@ class EmployeeTimeline:
         t = self.trial(job, buffer_min, travel_min)
         if t is None: return None
         self.slots.append(t); self.cursor = t["end"] + pd.Timedelta(minutes=buffer_min+travel_min); return t
+
+def infer_duration(row, default_duration, cfg):
+    if "clean_duration_minutes" in row and pd.notna(row["clean_duration_minutes"]):
+        return int(row["clean_duration_minutes"])
+    if cfg is not None and not cfg.empty and "apartment" in cfg.columns:
+        apt_name = str(row.get("apartment","")).strip().lower()
+        hit = cfg[cfg["apartment"].astype(str).str.lower() == apt_name]
+        if not hit.empty: return int(hit.iloc[0].get("base_minutes", default_duration))
+    return default_duration
+
+def build_cleaning_jobs(day_df: pd.DataFrame, day, default_duration: int, cfg: pd.DataFrame, mop_minutes: int,
+                        day_start_t: time) -> pd.DataFrame:
+    the_day = pd.Timestamp(day).date()
+    start_of_day = TZ.localize(datetime.combine(the_day, day_start_t))
+    jobs = []
+    for _, row in day_df.iterrows():
+        apt = row.get("apartment", "Apto"); unit = row.get("unit_id", ""); guest = row.get("guest_name", "")
+        checkout = row.get("checkout", pd.NaT); checkin  = row.get("checkin",  pd.NaT)
+        is_co = pd.notna(checkout) and checkout.date() == the_day
+        is_ci = pd.notna(checkin)  and checkin.date()  == the_day
+        if is_co and is_ci:
+            duration = infer_duration(row, default_duration, pd.DataFrame()); start_window = checkout; deadline = checkin
+        elif is_co:
+            duration = infer_duration(row, default_duration, pd.DataFrame()); start_window = checkout; deadline = pd.NaT
+        elif is_ci:
+            duration = int(mop_minutes); start_window = start_of_day; deadline = checkin
+        else:
+            continue
+        jobs.append({"apartment": apt, "unit_id": unit, "guest_name": guest,
+                     "start_window": start_window, "deadline": deadline, "duration_min": int(duration)})
+    return pd.DataFrame(jobs)
 
 def greedy_assign(jobs_df, employees, buffer_min=10, travel_min=0, early_priority=True):
     if jobs_df is None or jobs_df.empty:
@@ -351,14 +374,28 @@ def greedy_assign(jobs_df, employees, buffer_min=10, travel_min=0, early_priorit
         emp_sel.schedule(job, buffer_min=buffer_min, travel_min=travel_min); assignments.append(slot)
     return pd.DataFrame(assignments), pd.DataFrame(unassigned)
 
+def plot_gantt(df: pd.DataFrame, title, label_key):
+    if df is None or df.empty:
+        st.info("No hay datos para mostrar."); return
+    fig, ax = plt.subplots(figsize=(11, 3 + 0.35*len(df)))
+    labels = list(df[label_key].unique())
+    y_map = {e:i for i,e in enumerate(labels)}
+    day0 = df["start"].iloc[0].replace(hour=0, minute=0, second=0, microsecond=0)
+    for _, row in df.iterrows():
+        y = y_map[row[label_key]]
+        start = row["start"].to_pydatetime(); end = row["end"].to_pydatetime()
+        left = (start - day0).total_seconds()/3600; width = (end-start).total_seconds()/3600
+        ax.barh(y, width, left=left)
+        ax.text(left+width/2, y, f"{row.get('apartment', row.get('employee',''))}", va="center", ha="center", fontsize=9)
+    ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels)
+    ax.set_xlabel("Horas del día"); ax.set_title(title); st.pyplot(fig)
+
 # ==============================
 # SIDEBAR (UNA SOLA FECHA)
 # ==============================
 with st.sidebar:
     st.header("⚙️ Configuración del Día")
-    work_date = st.date_input("Día a planificar", value=pd.Timestamp.now(TZ).date())
-    prep_date = (pd.Timestamp(work_date) - pd.Timedelta(days=1)).date()
-    st.caption(f"Preparación automática: día anterior → {prep_date}")
+    work_date = st.date_input("Día a planificar (y preparar)", value=pd.Timestamp.now(TZ).date())
 
     st.subheader("Jornada operativa")
     day_start_t = st.time_input("Inicio del día", value=time(8,0))
@@ -373,7 +410,6 @@ with st.sidebar:
         with c1: s = st.time_input(f"{label} – inicio", value=default_start)
         with c2: e = st.time_input(f"{label} – fin", value=default_end)
         return s, e
-
     e1_start, e1_end = shift_block("Empleado 1", time(8,0), time(17,0))
     e2_start, e2_end = shift_block("Empleado 2", time(8,0), time(17,0))
 
@@ -426,40 +462,53 @@ st.download_button("⬇️ Descargar Normalizado (Excel)", data=excel_buf.getval
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ==============================
-# PREPARACIÓN (DÍA ANTERIOR AUTOMÁTICO)
+# PREPARACIÓN / OPERATIVA DEL DÍA (MISMO DÍA)
 # ==============================
-st.header("📦 Preparación (día anterior)")
-prep_str = pd.Timestamp(prep_date).strftime("%Y-%m-%d")
-prep_df = normalized[ normalized["checkin_day"] == prep_str ].copy()
+st.header("📦 Preparación del día (mismo día)")
+
+today_str = pd.Timestamp(work_date).strftime("%Y-%m-%d")
+prep_df = normalized[(normalized["checkin_day"] == today_str) | (normalized["checkout_day"] == today_str)].copy()
+
 if prep_df.empty:
-    st.info("No hay check-ins para la fecha de preparación seleccionada (día anterior).")
+    st.info("No hay movimientos para la fecha seleccionada.")
 else:
     cols_show = [c for c in [
         "apartment","guest_name","number_guests","sofa_or_bed","reservation_id",
         "transporte","extra","parking","nombre","notes",
         "channel","payment_method","amount_due","total_price",
-        "cash_pickup","cash_amount","cash_reason",
-        "checkin_day","checkin_time"
+        "checkin_day","checkin_time","checkout_day","checkout_time"
     ] if c in prep_df.columns]
     st.dataframe(prep_df[cols_show], use_container_width=True)
 
-    cash_list = prep_df[prep_df.get("cash_pickup", False) == True]  # noqa: E712
-    st.subheader("💵 Recolección de CASH (Booking/efectivo)")
-    if cash_list.empty:
-        st.success("No hay recolecciones de CASH para esa fecha.")
-    else:
-        show_cols = [c for c in ["apartment","guest_name","checkin_time","cash_amount","cash_reason"] if c in cash_list.columns]
-        st.warning("Revisar y coordinar recolección de CASH en estos apartamentos:")
-        st.dataframe(cash_list[show_cols], use_container_width=True)
+# CASH pickup (en checkout del mismo día)
+st.subheader("💵 Recolección de CASH (en checkout de hoy)")
+cash_pickups = normalized[(normalized.get("cash_pickup", False) == True) & (normalized["checkout_day"] == today_str)]  # noqa: E712
+if cash_pickups.empty:
+    st.success("No hay recolecciones de CASH para hoy.")
+else:
+    show_cols = [c for c in ["apartment","guest_name","checkout_time","cash_amount","cash_reason"] if c in cash_pickups.columns]
+    st.warning("Coordinar recolección en estos apartamentos:")
+    st.dataframe(cash_pickups[show_cols], use_container_width=True)
 
 # ==============================
-# DISPONIBILIDAD POR APTO (GANTT)
+# RESUMEN POR APARTAMENTO (DÍA)
+# ==============================
+st.header("🧾 Resumen por apartamento (día)")
+day_df = filter_day(normalized, work_date)
+summary_df = day_summary(day_df, work_date)
+if summary_df.empty:
+    st.info("No hay resumen para mostrar.")
+else:
+    st.dataframe(summary_df, use_container_width=True)
+
+# ==============================
+# VENTANAS LIBRES (GANTT)
 # ==============================
 st.subheader("🏠 Ventanas disponibles por apartamento (Gantt)")
-day_df = filter_day(normalized, work_date)
-def _plot_windows(windows_df):
-    if windows_df.empty:
-        st.info("No hay ventanas disponibles para el día seleccionado."); return
+windows_df = build_apartment_windows(day_df, work_date, day_start_t, day_end_t)
+if windows_df.empty:
+    st.info("No hay ventanas disponibles para el día seleccionado.")
+else:
     fig, ax = plt.subplots(figsize=(11, 3 + 0.35*len(windows_df)))
     apartments = list(windows_df["apartment"].unique()); y_map = {a:i for i,a in enumerate(apartments)}
     day0 = windows_df["start"].iloc[0].replace(hour=0, minute=0, second=0, microsecond=0)
@@ -472,14 +521,11 @@ def _plot_windows(windows_df):
     ax.set_yticks(range(len(apartments))); ax.set_yticklabels(apartments)
     ax.set_xlabel("Horas del día"); ax.set_title("Ventanas libres para limpieza"); st.pyplot(fig)
 
-windows_df = build_apartment_windows(day_df, work_date, day_start_t, day_end_t)
-_plot_windows(windows_df)
-
 # ==============================
-# PLANIFICACIÓN / ASIGNACIÓN
+# ASIGNACIÓN / PLAN
 # ==============================
 st.header("🧭 Horario de Limpieza (asignación)")
-jobs_df = build_cleaning_jobs(day_df, work_date, default_duration, pd.DataFrame(), mop_minutes, day_start_t, day_end_t)
+jobs_df = build_cleaning_jobs(day_df, work_date, default_duration, pd.DataFrame(), mop_minutes, day_start_t)
 st.subheader("🧱 Trabajos a programar"); st.dataframe(jobs_df, use_container_width=True)
 
 e1 = EmployeeTimeline(emp1_name, e1_start, e1_end, e1_l1, e1_l2, work_date)
@@ -499,7 +545,8 @@ if not plan_df.empty:
         y = y_map[row["employee"]]
         start = row["start"].to_pydatetime(); end = row["end"].to_pydatetime()
         left = (start - day0).total_seconds()/3600; width = (end-start).total_seconds()/3600
-        ax.barh(y, width, left=left); ax.text(left+width/2, y, f"{row['apartment']}", va="center", ha="center", fontsize=9)
+        ax.barh(y, width, left=left)
+        ax.text(left+width/2, y, f"{row['apartment']}", va="center", ha="center", fontsize=9)
     ax.set_yticks(range(len(employees))); ax.set_yticklabels(employees)
     ax.set_xlabel("Horas del día"); ax.set_title("Plan de Limpiezas (Gantt)"); st.pyplot(fig)
 else:
