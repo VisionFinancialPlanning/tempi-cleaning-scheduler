@@ -1,240 +1,342 @@
-import io
-import re
-from datetime import datetime, time
+import os
+os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
+import matplotlib
+matplotlib.use("Agg")
 
-import pandas as pd
-import pytz
 import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta, time
+import pytz
 
-# ==============================
-# CONFIGURACIÓN GENERAL APP
-# ==============================
 TZ = pytz.timezone("America/Panama")
-st.set_page_config(page_title="Tempi – Scheduler & Bookings", page_icon="🧹", layout="wide")
-st.title("Tempi – Scheduler & Bookings 🧹📒")
+st.set_page_config(page_title="Tempi Cleaning Scheduler", layout="wide")
 
-st.caption("Todo en un solo lugar: dashboard de limpieza + carga/normalización de reservas por Excel. Zona horaria: America/Panama.")
+def auth_gate():
+    try:
+        pwd = st.sidebar.text_input("Contraseña", type="password")
+        if pwd != st.secrets.get("APP_PASSWORD", "tempi"):
+            st.sidebar.info("Ingresa la contraseña para continuar")
+            st.stop()
+    except Exception:
+        # Si no hay secrets configurados, usa valor por defecto
+        pwd = st.sidebar.text_input("Contraseña", type="password")
+        if pwd != "tempi":
+            st.sidebar.info("Ingresa la contraseña para continuar")
+            st.stop()
+auth_gate()
 
-# ==============================
-# HELPERS COMUNES (Fechas/Horas)
-# ==============================
-DATE_COL_PATTERNS = [
-    r"check[-_\s]*in[\s_-]*date",
-    r"check[-_\s]*out[\s_-]*date",
-    r"arrival|arribo|llegada",
-    r"departure|salida",
-    r"fecha\s*check\s*in",
-    r"fecha\s*check\s*out",
-    r"checkin\s*date|checkout\s*date",
-]
-TIME_COL_PATTERNS = [
-    r"check[-_\s]*in[\s_-]*time",
-    r"check[-_\s]*out[\s_-]*time",
-    r"hora\s*check\s*in|hora\s*entrada|hora\s*ingreso",
-    r"hora\s*check\s*out|hora\s*salida",
-    r"arrival\s*time|departure\s*time",
-]
-APT_PATTERNS = [r"apto|apartment|unidad|listing|propiedad|unit|room|departamento|apt|apartment\s*name"]
-GUEST_PATTERNS = [r"guest|hu(e|é)sped|name|cliente|reserv(a|ation)\s*name|contact"]
+st.title("🧼 Tempi – Planificador Diario de Limpiezas")
 
+with st.sidebar:
+    st.header("⚙️ Configuración")
+    work_date = st.date_input("Día a planificar", value=pd.Timestamp.now(TZ).date())
 
-def _best_match(colnames, patterns):
-    lower_map = {c: c.lower() for c in colnames}
-    for pat in patterns:
-        rx = re.compile(pat, flags=re.IGNORECASE)
-        for c in colnames:
-            if rx.search(lower_map[c]):
-                return c
-    return None
+    st.subheader("Empleadas (2)")
+    emp1_name = st.text_input("Empleado 1", value="Mayerlin")
+    emp2_name = st.text_input("Empleado 2", value="Evelyn")
 
+    def shift_block(label, default_start=time(8, 0), default_end=time(17, 0)):
+        c1, c2 = st.columns(2)
+        with c1:
+            s = st.time_input(f"{label} – inicio", value=default_start)
+        with c2:
+            e = st.time_input(f"{label} – fin", value=default_end)
+        return s, e
 
-def _coerce_date(series):
-    return pd.to_datetime(series, errors="coerce").dt.tz_localize(None)
+    st.caption("Turnos y almuerzo – se aplican a cada empleada")
+    e1_start, e1_end = shift_block("Empleado 1", time(8,0), time(17,0))
+    e2_start, e2_end = shift_block("Empleado 2", time(8,0), time(17,0))
 
+    st.subheader("Almuerzo")
+    e1_l1, e1_l2 = shift_block("Empleado 1 – Almuerzo", time(12,0), time(13,0))
+    e2_l1, e2_l2 = shift_block("Empleado 2 – Almuerzo", time(12,30), time(13,30))
 
-def _coerce_time(series):
-    def parse_one(v):
-        if pd.isna(v):
-            return None
-        if isinstance(v, (pd.Timestamp, datetime)):
-            return v.time()
-        if isinstance(v, (int, float)):
-            try:
-                seconds = float(v) * 24 * 3600
-                seconds = int(round(seconds))
-                return (datetime(1900, 1, 1) + pd.to_timedelta(seconds, unit="s")).time()
-            except Exception:
-                return None
-        s = str(v).strip()
-        s = s.replace(".", ":")
-        try:
-            t = pd.to_datetime(s, errors="coerce").time()
-            return t
-        except Exception:
-            pass
-        m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
-        if m:
-            h = int(m.group(1)); mi = int(m.group(2)); se = int(m.group(3) or 0)
-            h = h % 24
-            return datetime(1900,1,1,h,mi,se).time()
+    st.subheader("Parámetros del plan")
+    buffer_minutes = st.number_input("Buffer entre limpiezas (min)", value=10, step=5)
+    travel_minutes = st.number_input("Traslado entre apartamentos (min)", value=0, step=5)
+    default_duration = st.number_input("Duración por defecto (min)", value=90, step=5)
+    early_priority = st.checkbox("Priorizar salidas tempranas (deadline primero)", value=True)
+    use_apt_cfg = st.checkbox("Usar matriz de tiempos por apartamento (apartment_config.csv)", value=True)
+
+uploaded = st.file_uploader("Sube tu Excel de reservas • O usa `sample_bookings.xlsx`", type=["xlsx", "xls", "csv"])
+
+# === NUEVO parse_bookings: admite columnas exactas 'Check-In', 'Check-In Hora', 'Check-Out', 'Check-Out Hora'.
+# Si faltan horas, aplica Check-In 15:00 y Check-Out 12:00.
+
+def parse_bookings(df: pd.DataFrame) -> pd.DataFrame:
+    # Standardize column names dict (lowercase for detection)
+    cols_lower = {c.lower().strip(): c for c in df.columns}
+    # mapping for legacy columns
+    ren = {}
+    for k in ["apartment", "unit_id", "guest_name", "checkout", "checkin", "clean_duration_minutes"]:
+        for orig_lower, orig in cols_lower.items():
+            if orig_lower == k:
+                ren[orig] = k
+    df = df.rename(columns=ren)
+
+    # If new fixed columns exist: "Check-In","Check-In Hora","Check-Out","Check-Out Hora"
+    # (case-insensitive match)
+    def find_col(name):
+        for orig_lower, orig in cols_lower.items():
+            if orig_lower == name.lower():
+                return orig
         return None
 
-    return series.apply(parse_one)
+    ci_date_col = find_col("Check-In")
+    ci_time_col = find_col("Check-In Hora")
+    co_date_col = find_col("Check-Out")
+    co_time_col = find_col("Check-Out Hora")
 
+    def _coerce_time(series):
+        def parse_one(v):
+            if pd.isna(v):
+                return None
+            if isinstance(v, (pd.Timestamp, datetime)):
+                return v.time()
+            try:
+                return pd.to_datetime(str(v), errors="coerce").time()
+            except Exception:
+                return None
+        return series.apply(parse_one)
 
-def _combine_date_time(date_series, time_series, default_time=None):
-    dt = pd.to_datetime(date_series, errors="coerce")
-    times = _coerce_time(time_series) if time_series is not None else None
-    out = []
-    for d, t in zip(dt, times if times is not None else [None]*len(dt)):
-        if pd.isna(d):
-            out.append(pd.NaT)
-        else:
-            if t is None and default_time is not None:
-                t = default_time
-            elif t is None:
+    def _combine(date_s, time_s, default_time: time):
+        dates = pd.to_datetime(date_s, errors="coerce")
+        times = _coerce_time(time_s) if time_s is not None else None
+        out = []
+        for d, t in zip(dates, times if times is not None else [None]*len(dates)):
+            if pd.isna(d):
                 out.append(pd.NaT)
-                continue
-            out.append(pd.Timestamp.combine(d.date(), t))
-    return pd.to_datetime(out, errors="coerce").dt.tz_localize(TZ, nonexistent="NaT", ambiguous="NaT").dt.tz_convert(TZ)
+            else:
+                if t is None:
+                    t = default_time
+                out.append(pd.Timestamp.combine(pd.Timestamp(d).date(), t))
+        return pd.to_datetime(out, errors="coerce").dt.tz_localize(TZ, nonexistent="NaT", ambiguous="NaT").dt.tz_convert(TZ)
 
+    if ci_date_col and co_date_col:
+        # Build checkin/checkout even if legacy columns are missing
+        ci_dt = _combine(df[ci_date_col], df[ci_time_col] if (ci_time_col and ci_time_col in df.columns) else None, default_time=time(15,0))
+        co_dt = _combine(df[co_date_col], df[co_time_col] if (co_time_col and co_time_col in df.columns) else None, default_time=time(12,0))
+        df["checkin"] = ci_dt
+        df["checkout"] = co_dt
 
-def normalize_bookings(df_raw: pd.DataFrame,
-                       col_checkin_date: str,
-                       col_checkout_date: str,
-                       col_checkin_time: str | None,
-                       col_checkout_time: str | None,
-                       col_apartment: str | None,
-                       col_guest: str | None) -> pd.DataFrame:
-    """Normaliza un DataFrame de reservas y devuelve columnas estandarizadas."""
-    out = pd.DataFrame()
-    if col_apartment:
-        out["apartment"] = df_raw[col_apartment].astype(str).str.strip()
-    if col_guest:
-        out["guest_name"] = df_raw[col_guest].astype(str).str.strip()
+    # Coerce legacy date columns if present
+    for col in ["checkout", "checkin"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    out["checkin_date_raw"] = _coerce_date(df_raw[col_checkin_date])
-    out["checkout_date_raw"] = _coerce_date(df_raw[col_checkout_date])
+    if "clean_duration_minutes" not in df.columns:
+        df["clean_duration_minutes"] = np.nan
+    return df
 
-    checkin_dt = _combine_date_time(
-        df_raw[col_checkin_date],
-        df_raw[col_checkin_time] if col_checkin_time else None,
-        default_time=time(15, 0),
-    )
-    checkout_dt = _combine_date_time(
-        df_raw[col_checkout_date],
-        df_raw[col_checkout_time] if col_checkout_time else None,
-        default_time=time(12, 0),
-    )
+@st.cache_data
+def load_apartment_config():
+    try:
+        return pd.read_csv("apartment_config.csv")
+    except Exception:
+        return pd.DataFrame()
 
-    out["checkin_at"] = checkin_dt
-    out["checkout_at"] = checkout_dt
-
-    out["nights"] = (out["checkout_at"].dt.date - out["checkin_at"].dt.date).apply(lambda d: d.days if pd.notna(d) else None)
-    out["checkin_day"] = out["checkin_at"].dt.strftime("%Y-%m-%d")
-    out["checkin_time"] = out["checkin_at"].dt.strftime("%H:%M").fillna("")
-    out["checkout_day"] = out["checkout_at"].dt.strftime("%Y-%m-%d")
-    out["checkout_time"] = out["checkout_at"].dt.strftime("%H:%M").fillna("")
-
-    preferred_cols = [
-        "apartment", "guest_name", "checkin_day", "checkin_time", "checkout_day", "checkout_time", "nights",
-    ]
-    ordered = [c for c in preferred_cols if c in out.columns] + [c for c in out.columns if c not in preferred_cols]
-    return out[ordered]
-
-
-# ==============================
-# LAYOUT PRINCIPAL (TABS)
-# ==============================
-TAB1, TAB2 = st.tabs(["🧭 Horario de Limpieza (existente)", "📒 Cargar/Normalizar Reservas (Excel)"])
-
-with TAB1:
-    st.subheader("Horario de limpieza")
-    st.info("Aquí va tu lógica actual del scheduler. (Integramos sin tocar tu flujo).")
-    # TODO: Pega aquí tu código existente del scheduler (lo que ya tenías en app.py)
-
-with TAB2:
-    st.subheader("Cargar/Normalizar Reservas (Excel)")
-    st.write(
-        "Puedes subir tu Excel. Si no subes nada, cargaremos automáticamente **sample_bookings.xlsx** del repo como archivo de ejemplo. Si tampoco existe, te lo indicaremos."
-    )
-
-    uploaded = st.file_uploader("Sube tu archivo Excel (.xlsx)", type=["xlsx"], accept_multiple_files=False)
-
-    # Carga fuente: 1) lo subido 2) sample_bookings.xlsx
-    df_raw = None
-    source_label = None
-
-    if uploaded is not None:
+def filter_day(df: pd.DataFrame, day: datetime.date) -> pd.DataFrame:
+    start = pd.Timestamp(day, tz=TZ)
+    end = start + pd.Timedelta(days=1)
+    def to_panama(series: pd.Series) -> pd.Series:
+        s = pd.to_datetime(series, errors="coerce")
         try:
-            xl = pd.ExcelFile(uploaded)
-            sheet = st.selectbox("Selecciona la hoja a procesar", xl.sheet_names)
-            df_raw = xl.parse(sheet)
-            source_label = f"Archivo subido: {uploaded.name} – Hoja: {sheet}"
-        except Exception as e:
-            st.error(f"No se pudo leer el archivo subido: {e}")
+            s = s.dt.tz_convert(TZ)
+        except Exception:
+            try:
+                s = s.dt.tz_localize(TZ)
+            except Exception:
+                s = s
+        return s
+    if "checkout" in df.columns:
+        df["checkout"] = to_panama(df["checkout"])
+    if "checkin" in df.columns:
+        df["checkin"] = to_panama(df["checkin"])
+    mask = (
+        (df["checkout"].between(start, end, inclusive="left")) |
+        (df["checkin"].between(start, end, inclusive="left"))
+    )
+    return df[mask].copy()
+
+def infer_duration(row, default_duration, cfg):
+    if pd.notna(row.get("clean_duration_minutes")):
+        return int(row["clean_duration_minutes"])
+    if cfg is not None and not cfg.empty:
+        hit = cfg[cfg["apartment"].str.lower() == str(row.get("apartment", "")).lower()]
+        if not hit.empty:
+            return int(hit.iloc[0].get("base_minutes", default_duration))
+    return default_duration
+
+def build_cleaning_jobs(day_df: pd.DataFrame, day: datetime.date, default_duration: int, cfg: pd.DataFrame) -> pd.DataFrame:
+    jobs = []
+    for _, row in day_df.iterrows():
+        apt = row.get("apartment", "Apto")
+        checkout = row.get("checkout", pd.NaT)
+        checkin = row.get("checkin", pd.NaT)
+        duration = infer_duration(row, default_duration, cfg)
+        start_window = checkout if pd.notna(checkout) else pd.Timestamp.combine(day, time(8, 0), tzinfo=TZ)
+        deadline = checkin if (pd.notna(checkin) and checkin.date() == day) else pd.NaT
+        jobs.append({
+            "apartment": apt,
+            "unit_id": row.get("unit_id", ""),
+            "guest_name": row.get("guest_name", ""),
+            "start_window": start_window,
+            "deadline": deadline,
+            "duration_min": int(duration)
+        })
+    return pd.DataFrame(jobs)
+
+class EmployeeTimeline:
+    def __init__(self, name, start_t: time, end_t: time, lunch_start: time, lunch_end: time, day: datetime.date):
+        self.name = name
+        self.day = day
+        self.start_dt = TZ.localize(datetime.combine(day, start_t))
+        self.end_dt = TZ.localize(datetime.combine(day, end_t))
+        self.lunch_start = TZ.localize(datetime.combine(day, lunch_start))
+        self.lunch_end = TZ.localize(datetime.combine(day, lunch_end))
+        self.cursor = self.start_dt
+        self.slots = []
+    def _overlaps_lunch(self, start, end):
+        return not (end <= self.lunch_start or start >= self.lunch_end)
+    def trial(self, job, buffer_min=10, travel_min=0):
+        est = max(self.cursor, job["start_window"]) + pd.Timedelta(minutes=travel_min)
+        end = est + pd.Timedelta(minutes=job["duration_min"])
+        if self._overlaps_lunch(est, end):
+            return None
+        deadline = job["deadline"] if pd.notna(job["deadline"]) else self.end_dt
+        if end > deadline or end > self.end_dt:
+            return None
+        return {
+            "employee": self.name,
+            "apartment": job["apartment"],
+            "unit_id": job["unit_id"],
+            "guest_name": job.get("guest_name", ""),
+            "start": est,
+            "end": end,
+            "duration_min": job["duration_min"]
+        }
+    def schedule(self, job, buffer_min=10, travel_min=0):
+        trial = self.trial(job, buffer_min=buffer_min, travel_min=travel_min)
+        if trial is None:
+            return None
+        self.slots.append(trial)
+        self.cursor = trial["end"] + pd.Timedelta(minutes=buffer_min + travel_min)
+        return trial
+
+def greedy_assign(jobs_df, employees, buffer_min=10, travel_min=0, early_priority=True):
+    if jobs_df is None or jobs_df.empty:
+        return pd.DataFrame(columns=["employee","apartment","unit_id","guest_name","start","end","duration_min"]), pd.DataFrame()
+    sort_keys = jobs_df.copy()
+    min_date = sort_keys["start_window"].dt.date.min()
+    far = TZ.localize(datetime.combine(min_date, time(23, 59))) + pd.Timedelta(days=1)
+    sort_keys["deadline_filled"] = sort_keys["deadline"].fillna(far)
+    jobs_sorted = sort_keys.sort_values(
+        ["deadline_filled", "start_window", "duration_min"] if early_priority
+        else ["start_window", "deadline_filled", "duration_min"]
+    ).drop(columns=["deadline_filled"])
+    assignments, unassigned = [], []
+    for _, job in jobs_sorted.iterrows():
+        candidates = []
+        for emp in employees:
+            t = emp.trial(job, buffer_min=buffer_min, travel_min=travel_min)
+            if t is not None:
+                candidates.append((emp, t))
+        if not candidates:
+            unassigned.append(job.to_dict())
+            continue
+        # escoger el fin más temprano
+        emp_sel, slot = sorted(candidates, key=lambda x: x[1]["end"])[0]
+        emp_sel.schedule(job, buffer_min=buffer_min, travel_min=travel_min)
+        assignments.append(slot)
+    return pd.DataFrame(assignments), pd.DataFrame(unassigned)
+
+def plot_gantt(plan_df: pd.DataFrame):
+    if plan_df is None or plan_df.empty:
+        st.info("No hay asignaciones para mostrar.")
+        return
+    fig, ax = plt.subplots(figsize=(10, 3+0.3*len(plan_df)))
+    employees = list(plan_df["employee"].unique())
+    y_map = {e:i for i,e in enumerate(employees)}
+    for _, row in plan_df.iterrows():
+        y = y_map[row["employee"]]
+        start = row["start"].to_pydatetime()
+        end = row["end"].to_pydatetime()
+        ax.barh(y, (end-start).total_seconds()/3600, left=(start - start.replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds()/3600)
+        ax.text(((start.hour*60+start.minute)+(end.hour*60+end.minute))/120, y, f"{row['apartment']}", va='center')
+    ax.set_yticks(range(len(employees)))
+    ax.set_yticklabels(employees)
+    ax.set_xlabel("Horas del día")
+    ax.set_title("Plan de Limpiezas (Gantt)")
+    st.pyplot(fig)
+
+def whatsapp_summary(plan_df: pd.DataFrame) -> str:
+    if plan_df is None or plan_df.empty:
+        return "(Sin asignaciones)"
+    lines = ["*Plan de Limpiezas* 🧼"]
+    for emp in plan_df["employee"].unique():
+        lines.append(f"\n*{emp}*")
+        sub = plan_df[plan_df["employee"]==emp]
+        for _, r in sub.sort_values("start").iterrows():
+            lines.append(f"• {r['apartment']} — {r['start'].strftime('%H:%M')}–{r['end'].strftime('%H:%M')} ({int(r['duration_min'])}m)")
+    return "\n".join(lines)
+
+# === FLUJO PRINCIPAL ===
+if uploaded is not None:
+    if uploaded.name.endswith(".csv"):
+        df_raw = pd.read_csv(uploaded)
     else:
-        # Fallback: sample_bookings.xlsx en el repo
-        try:
-            xl = pd.ExcelFile("sample_bookings.xlsx")
-            sheet = st.selectbox("Selecciona la hoja a procesar", xl.sheet_names)
-            df_raw = xl.parse(sheet)
-            source_label = f"Archivo de ejemplo: sample_bookings.xlsx – Hoja: {sheet}"
-        except Exception as e:
-            st.warning("No subiste archivo y no se encontró sample_bookings.xlsx en el repo.")
+        df_raw = pd.read_excel(uploaded)
+else:
+    st.info("Usando datos de ejemplo `sample_bookings.xlsx` (en el repo)")
+    df_raw = pd.read_excel("sample_bookings.xlsx")
 
-    if df_raw is None:
-        st.stop()
+st.subheader("📄 Reservas – Original (preview)")
+st.dataframe(df_raw.head(10), use_container_width=True)
 
-    st.write(f"**Fuente:** {source_label}")
-    st.write("### Vista previa (primeras 10 filas)")
-    st.dataframe(df_raw.head(10), use_container_width=True)
+# Normaliza según tus columnas (Check-In / Check-In Hora / Check-Out / Check-Out Hora)
+df = parse_bookings(df_raw)
 
-    cols = list(df_raw.columns)
-    col_checkin_date = _best_match(cols, [DATE_COL_PATTERNS[0], DATE_COL_PATTERNS[2], DATE_COL_PATTERNS[4], DATE_COL_PATTERNS[6]])
-    col_checkout_date = _best_match(cols, [DATE_COL_PATTERNS[1], DATE_COL_PATTERNS[3], DATE_COL_PATTERNS[5]])
-    col_checkin_time = _best_match(cols, [TIME_COL_PATTERNS[0], TIME_COL_PATTERNS[2]])
-    col_checkout_time = _best_match(cols, [TIME_COL_PATTERNS[1], TIME_COL_PATTERNS[3]])
-    col_apartment = _best_match(cols, APT_PATTERNS)
-    col_guest = _best_match(cols, GUEST_PATTERNS)
+# Filtrar por día
+day_df = filter_day(df, work_date)
+st.subheader("📄 Reservas del día (normalizadas)")
+st.dataframe(day_df, use_container_width=True)
 
-    st.write("### Mapeo de columnas")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        col_checkin_date = st.selectbox("Fecha Check‑in", [None] + cols, index=(cols.index(col_checkin_date)+1) if col_checkin_date in cols else 0)
-        col_checkin_time = st.selectbox("Hora Check‑in (opcional)", [None] + cols, index=(cols.index(col_checkin_time)+1) if col_checkin_time in cols else 0)
-    with col2:
-        col_checkout_date = st.selectbox("Fecha Check‑out", [None] + cols, index=(cols.index(col_checkout_date)+1) if col_checkout_date in cols else 0)
-        col_checkout_time = st.selectbox("Hora Check‑out (opcional)", [None] + cols, index=(cols.index(col_checkout_time)+1) if col_checkout_time in cols else 0)
-    with col3:
-        col_apartment = st.selectbox("Columna Apartamento/Unidad (opcional)", [None] + cols, index=(cols.index(col_apartment)+1) if col_apartment in cols else 0)
-        col_guest = st.selectbox("Columna Huésped/Nombre (opcional)", [None] + cols, index=(cols.index(col_guest)+1) if col_guest in cols else 0)
+apt_cfg = load_apartment_config() if use_apt_cfg else pd.DataFrame()
+jobs_df = build_cleaning_jobs(day_df, work_date, default_duration, apt_cfg)
 
-    if not col_checkin_date or not col_checkout_date:
-        st.error("Debes seleccionar al menos **Fecha Check‑in** y **Fecha Check‑out**.")
-        st.stop()
+st.subheader("🧱 Trabajos a programar")
+st.dataframe(jobs_df, use_container_width=True)
 
-    out = normalize_bookings(
-        df_raw,
-        col_checkin_date=col_checkin_date,
-        col_checkout_date=col_checkout_date,
-        col_checkin_time=col_checkin_time if col_checkin_time else None,
-        col_checkout_time=col_checkout_time if col_checkout_time else None,
-        col_apartment=col_apartment if col_apartment else None,
-        col_guest=col_guest if col_guest else None,
-    )
+# Timelines
+e1 = EmployeeTimeline(emp1_name, e1_start, e1_end, e1_l1, e1_l2, work_date)
+e2 = EmployeeTimeline(emp2_name, e2_start, e2_end, e2_l1, e2_l2, work_date)
+plan_df, un_df = greedy_assign(
+    jobs_df, [e1, e2],
+    buffer_min=buffer_minutes,
+    travel_min=travel_minutes,
+    early_priority=early_priority
+)
 
-    st.success("✅ Listo. Abajo puedes revisar los resultados y descargarlos.")
-    st.dataframe(out, use_container_width=True)
+st.subheader("🗓️ Plan asignado")
+st.dataframe(plan_df, use_container_width=True)
 
-    # Botones de descarga
-    csv_bytes = out.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Descargar CSV", data=csv_bytes, file_name="checkins_checkouts.csv", mime="text/csv")
+if not un_df.empty:
+    st.warning("No se pudieron asignar algunos trabajos:")
+    st.dataframe(un_df, use_container_width=True)
 
-    excel_buf = io.BytesIO()
-    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-        out.to_excel(writer, sheet_name="checkins_checkouts", index=False)
+st.subheader("📊 Visualización")
+plot_gantt(plan_df)
 
-    st.download_button("⬇️ Descargar Excel", data=excel_buf.getvalue(), file_name="checkins_checkouts.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+st.subheader("📲 Resumen para WhatsApp")
+wa = whatsapp_summary(plan_df)
+st.code(wa)
 
-    st.caption("Si el archivo no trae horas, se asigna automáticamente: Check‑in 3:00 PM, Check‑out 12:00 PM.")
+csv = plan_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "⬇️ Descargar plan (CSV)",
+    data=csv,
+    file_name=f"plan_{work_date}.csv",
+    mime="text/csv"
+)
