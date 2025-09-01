@@ -3,18 +3,20 @@ import os
 os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
 
 import re, unicodedata
-import streamlit as st
-import pandas as pd
+import urllib.parse as _q
+from datetime import datetime, time, timedelta
+
+import pytz
 import numpy as np
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from datetime import datetime, time, timedelta
-import pytz
+import streamlit as st
 from pandas.api.types import is_datetime64_any_dtype as _is_dt
 
 # ==============================
-# CONFIG
+# CONFIGURACIÓN GLOBAL
 # ==============================
 TZ_NAME = "America/Panama"
 TZ = pytz.timezone(TZ_NAME)
@@ -52,6 +54,7 @@ def _coerce_time(series):
         if pd.isna(v): return None
         if isinstance(v, (pd.Timestamp, datetime)): return v.time()
         if isinstance(v, (int, float)):
+            # Excel time serial
             try:
                 frac = float(v) % 1.0
                 secs = int(round(frac * 24 * 3600))
@@ -97,12 +100,15 @@ def _combine_smart(date_s, explicit_time_s, default_time: time):
             out.append(pd.Timestamp.combine(pd.Timestamp(d).date(), tt))
     ser = pd.to_datetime(out, errors="coerce")
     if ser.empty or not _is_dt(ser): return ser
-    try: ser = ser.dt.tz_localize(TZ_NAME, nonexistent="NaT", ambiguous="NaT")
-    except Exception: return ser
+    try:
+        ser = ser.dt.tz_localize(TZ_NAME, nonexistent="NaT", ambiguous="NaT")
+    except Exception:
+        return ser
     return ser
 
 def _fmt_tz(series, fmt):
-    try:    return series.dt.tz_convert(TZ_NAME).dt.strftime(fmt)
+    try:
+        return series.dt.tz_convert(TZ_NAME).dt.strftime(fmt)
     except Exception:
         try: return series.dt.strftime(fmt)
         except Exception: return pd.Series([""]*len(series))
@@ -142,7 +148,7 @@ def _day_bounds(day, start_t: time, end_t: time):
     return TZ.localize(datetime.combine(d, start_t)), TZ.localize(datetime.combine(d, end_t))
 
 def _canon_apt(x):
-    """Limpia nombre, elimina vacíos y unifica alias (Jeronimo...)."""
+    """Limpia nombre de apartamento, elimina vacíos y unifica alias Jerónimo."""
     if pd.isna(x):
         return np.nan
     s = re.sub(r"\s+", " ", str(x)).strip()
@@ -150,7 +156,6 @@ def _canon_apt(x):
         return np.nan
     norm = _norm(s)
     alias = {
-        # variantes comunes del mismo Jerónimo
         "jeronimocascoviejo": "Jeronimo Casco Viejo",
         "jeronimocentralandcozyapto": "Jeronimo Casco Viejo",
         "jeronimocentralandcozyapt": "Jeronimo Casco Viejo",
@@ -159,8 +164,16 @@ def _canon_apt(x):
     }
     return alias.get(norm, s)
 
+def to_tz(series: pd.Series) -> pd.Series:
+    s = pd.to_datetime(series, errors="coerce")
+    try: s = s.dt.tz_convert(TZ_NAME)
+    except Exception:
+        try: s = s.dt.tz_localize(TZ_NAME)
+        except Exception: pass
+    return s
+
 # ==============================
-# NORMALIZACIÓN
+# NORMALIZACIÓN DE EXCEL
 # ==============================
 def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     if _find_col(df, ["Check-In"]) is None or _find_col(df, ["Check-Out"]) is None:
@@ -188,7 +201,7 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     apt_col   = _find_col(df, ["Property Internal Name"])
     guest_col = _find_col(df, ["Guest First Name"])
     if apt_col:
-        out["apartment"]  = df[apt_col].apply(_canon_apt)  # <- normaliza apto (quita nan, unifica Jeronimo)
+        out["apartment"]  = df[apt_col].apply(_canon_apt)
     if guest_col:
         out["guest_name"] = df[guest_col].astype(str)
 
@@ -211,18 +224,10 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
         if c: out[new_col] = df[c]
 
     # Transporte específico por evento (solo SI)
-    trans_ci_col = _find_col(df, [
-        "TRANSPORTE CHECK-IN", "Transporte Check-In", "Transporte Check In",
-        "Pickup Check-In", "Transfer Check-In"
-    ])
-    trans_co_col = _find_col(df, [
-        "TRANSPORTE CHECK-OUT", "Transporte Check-Out", "Transporte Check Out",
-        "Pickup Check-Out", "Transfer Check-Out"
-    ])
-    if trans_ci_col:
-        out["transport_ci"] = df[trans_ci_col]
-    if trans_co_col:
-        out["transport_co"] = df[trans_co_col]
+    trans_ci_col = _find_col(df, ["TRANSPORTE CHECK-IN", "Transporte Check-In", "Transporte Check In", "Pickup Check-In", "Transfer Check-In"])
+    trans_co_col = _find_col(df, ["TRANSPORTE CHECK-OUT", "Transporte Check-Out", "Transporte Check Out", "Pickup Check-Out", "Transfer Check-Out"])
+    if trans_ci_col: out["transport_ci"] = df[trans_ci_col]
+    if trans_co_col: out["transport_co"] = df[trans_co_col]
 
     out["checkin"]  = ci_dt
     out["checkout"] = co_dt
@@ -277,32 +282,19 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out[cols]
 
 # ==============================
-# EVENTOS / RESUMEN / GANTT
+# EVENTOS / VENTANAS / RESUMEN
 # ==============================
-def to_tz(series: pd.Series) -> pd.Series:
-    s = pd.to_datetime(series, errors="coerce")
-    try: s = s.dt.tz_convert(TZ_NAME)
-    except Exception:
-        try: s = s.dt.tz_localize(TZ_NAME)
-        except Exception: pass
-    return s
-
 def _events_por_apartamento(normalized: pd.DataFrame, day, day_start_t: time, day_end_t: time, extra_apartments=None):
-    """
-    Devuelve dict por apto con:
-    cis, cos, ocupado, ventana=(inicio, fin, kind) donde kind ∈ {turnover, solo checkout, solo check-in, vacio}
-    """
+    """Devuelve dict por apto: cis, cos, ocupado, ventana=(ini, fin, tipo) con tipo∈{turnover, solo checkout, solo check-in, vacio}."""
     start_of_day, end_of_day = _day_bounds(day, day_start_t, day_end_t)
     df = normalized.copy()
-    df["apartment"] = df["apartment"]  # ya viene canónico
     df["checkin"]  = to_tz(df["checkin"])
     df["checkout"] = to_tz(df["checkout"])
 
     apts = sorted(df["apartment"].dropna().astype(str).unique().tolist())
     if extra_apartments:
         for x in extra_apartments:
-            if x not in apts:
-                apts.append(x)
+            if x not in apts: apts.append(x)
 
     out = {}
     for apt in apts:
@@ -337,7 +329,7 @@ def day_summary_collapsed_v2(normalized: pd.DataFrame, day, day_start_t: time, d
     for apt, d in ev.items():
         cis, cos, v = d["cis"], d["cos"], d["ventana"]
         def _fmt(ts_list): return ", ".join(sorted({t.strftime("%H:%M") for t in ts_list})) if ts_list else ""
-        if v is None:  # ocupado pero sin ventana util
+        if v is None:  # ocupado pero sin ventana útil
             continue
         ini, fin, kind = v
         if kind == "turnover":
@@ -354,10 +346,9 @@ def day_summary_collapsed_v2(normalized: pd.DataFrame, day, day_start_t: time, d
     if df.empty:
         return pd.DataFrame(columns=["apartment","tipo","checkout_time","checkin_time","gap_hours"])
 
-    # quitar nulos por si acaso
     df = df[df["apartment"].notna()].copy()
 
-    # BALI siempre al final
+    # BALI al final del resumen
     df["__bali__"] = df["apartment"].astype(str).eq("BALI")
     df = df.sort_values(["__bali__", "tipo", "apartment"], ascending=[True, True, True]).drop(columns="__bali__")
     return df.reset_index(drop=True)
@@ -377,7 +368,9 @@ def build_apartment_windows_v2(normalized: pd.DataFrame, day, day_start_t: time,
     out = out.sort_values(["__bali__", "apartment"]).drop(columns="__bali__").reset_index(drop=True)
     return out
 
-# ============ Scheduler automático (opcional) ============
+# ==============================
+# PLANIFICADOR (opcional)
+# ==============================
 class EmployeeTimeline:
     def __init__(self, name, start_t: time, end_t: time, lunch_start: time, lunch_end: time, day):
         self.name = name; self.day = pd.Timestamp(day).date()
@@ -441,7 +434,7 @@ def plot_gantt(df: pd.DataFrame, title, y_key):
     ax.set_xlabel("Horas del día"); ax.set_title(title); st.pyplot(fig)
 
 # ==============================
-# SIDEBAR
+# SIDEBAR (config)
 # ==============================
 with st.sidebar:
     st.header("⚙️ Configuración del Día")
@@ -473,6 +466,10 @@ with st.sidebar:
     default_duration= st.number_input("Duración limpieza completa (min)", value=90, step=5)
     mop_minutes     = st.number_input("Duración mopa (solo check-in) (min)", value=20, step=5)
     early_priority  = st.checkbox("Priorizar salidas tempranas (deadline primero)", value=True)
+
+    st.subheader("WhatsApp (opcional)")
+    wa_emp1 = st.text_input("WhatsApp Empleado 1 (solo dígitos)", value="")
+    wa_emp2 = st.text_input("WhatsApp Empleado 2 (solo dígitos)", value="")
 
 # ==============================
 # CARGA ARCHIVO
@@ -531,6 +528,7 @@ with tab1:
     trans_df = prep_df.copy()
     has_ci = "transport_ci" in trans_df.columns
     has_co = "transport_co" in trans_df.columns
+
     def _hora_from_cols(row, kind):
         if kind == "ci":
             if "checkin_time" in row and pd.notna(row["checkin_time"]) and str(row["checkin_time"]).strip():
@@ -545,6 +543,7 @@ with tab1:
                 try: return row["checkout"].tz_convert(TZ_NAME).strftime("%H:%M")
                 except Exception: return pd.to_datetime(row["checkout"]).strftime("%H:%M")
         return ""
+
     if has_ci or has_co:
         out_rows = []
         if has_ci:
@@ -581,16 +580,16 @@ with tab1:
 
     # ========================= Resumen + ASIGNACIÓN MANUAL =========================
     st.subheader("🧾 Resumen por apartamento (día) + asignación manual")
-    extra_apts = ["BALI"]  # <— apartamento extra fijo
+    extra_apts = ["BALI"]  # apartamento extra fijo
     summary_df = day_summary_collapsed_v2(normalized, work_date, day_start_t, day_end_t, extra_apts)
     st.dataframe(summary_df, use_container_width=True)
 
-    # ---- editor de asignaciones manuales ----
     st.markdown("**Asigna quién y a qué hora limpiar (manual)**")
-    # Ventanas por apto
+    # Ventanas por apto (para referencia)
     win_df = build_apartment_windows_v2(normalized, work_date, day_start_t, day_end_t, extra_apts)
     win_map = {r["apartment"]: r for _, r in win_df.iterrows()}
-    def _fmt(t): return t.tz_convert(TZ_NAME).strftime("%H:%M")
+    def _fmt(t): return t.tz_convert(TZ_NAME).strftime("%H:%M") if pd.notna(t) else ""
+
     base_rows = []
     for _, r in summary_df.iterrows():
         apt = r["apartment"]
@@ -636,7 +635,7 @@ with tab1:
         num_rows="fixed"
     )
 
-    # Convertimos las selecciones a un plan manual y graficamos
+    # Convertimos selecciones a plan manual
     def _to_dt(day, hhmm):
         if not hhmm or str(hhmm).strip() == "": return pd.NaT
         t = datetime.strptime(hhmm, "%H:%M").time()
@@ -662,7 +661,54 @@ with tab1:
     else:
         plot_gantt(manual_plan, title="Plan Manual de Limpieza (Gantt)", y_key="employee")
 
-    # ========================= Ventanas detectadas (info) =========================
+    # 💬 Mensajes WhatsApp por empleada
+    st.subheader("💬 Mensajes de WhatsApp (según plan manual)")
+    if manual_plan.empty:
+        st.info("Asigna empleado e intervalos (inicio/fin) en la tabla para generar los mensajes.")
+    else:
+        plan_msg = manual_plan.merge(summary_df[["apartment","tipo"]], on="apartment", how="left")
+
+        # CASH por apartamento (checkout de hoy)
+        cash_map = {}
+        if 'apartment' in cash_pickups.columns:
+            tmp_cash = cash_pickups.copy()
+            tmp_cash["co_hora"] = tmp_cash.get("checkout_time", "")
+            for _, rr in tmp_cash.iterrows():
+                key = rr.get("apartment", "")
+                cash_map.setdefault(key, [])
+                cash_map[key].append({
+                    "amount": rr.get("cash_amount", np.nan),
+                    "hora": rr.get("co_hora", "")
+                })
+
+        def _fmt_h(dt): 
+            try: return dt.tz_convert(TZ_NAME).strftime("%H:%M")
+            except Exception: return pd.to_datetime(dt).strftime("%H:%M")
+
+        for emp, g in plan_msg.sort_values("start").groupby("employee"):
+            lines = [f"Hola {emp}! Este es tu plan de limpieza para {pd.Timestamp(work_date).strftime('%d/%m/%Y')}:"]
+            for _, row in g.iterrows():
+                s = _fmt_h(row["start"]); e = _fmt_h(row["end"])
+                apt = row["apartment"]; tipo = row.get("tipo","")
+                extra = ""
+                if apt in cash_map:
+                    c = cash_map[apt][0]
+                    try:
+                        amt = float(c["amount"]) if not pd.isna(c["amount"]) else None
+                    except Exception:
+                        amt = None
+                    if amt is not None:
+                        extra = f" | Recoger CASH ${amt:,.2f}" + (f" (checkout {c['hora']})" if str(c['hora']).strip() else "")
+                lines.append(f"• {s}-{e}  {apt}  ({tipo}){extra}")
+            msg = "\n".join(lines) + "\n\n¡Gracias! 🙌"
+            st.text_area(f"Mensaje para {emp}", msg, height=160)
+            phone = wa_emp1 if emp == emp1_name else (wa_emp2 if emp == emp2_name else "")
+            phone_digits = re.sub(r"\D", "", phone or "")
+            if phone_digits:
+                wa_link = f"https://wa.me/{phone_digits}?text={_q.quote(msg)}"
+                st.markdown(f"[Abrir WhatsApp de **{emp}**]({wa_link})")
+
+    # Ventanas disponibles (info)
     st.subheader("🏠 Ventanas disponibles por apartamento (info)")
     windows_df = build_apartment_windows_v2(normalized, work_date, day_start_t, day_end_t, extra_apts)
     if windows_df.empty:
@@ -681,7 +727,7 @@ with tab1:
         ax.set_xlabel("Horas del día"); ax.set_title("Ventanas libres para limpieza")
         st.pyplot(fig)
 
-    # ======= (Opcional) Plan automático — dentro de un expander =======
+    # (Opcional) Plan automático dentro de un expander
     with st.expander("⚙️ Plan automático (opcional)"):
         def build_cleaning_jobs_v2(normalized: pd.DataFrame, day, default_duration: int, mop_minutes: int,
                                    day_start_t: time, day_end_t: time, extra_apts=None) -> pd.DataFrame:
@@ -690,8 +736,7 @@ with tab1:
             jobs = []
             for apt, d in ev.items():
                 v = d["ventana"]
-                if v is None: 
-                    continue
+                if v is None: continue
                 ini, fin, kind = v
                 if kind == "turnover":
                     jobs.append({"apartment": apt, "unit_id": "", "guest_name": "",
@@ -792,18 +837,25 @@ with tab2:
         show_cols = ["apartment","nights","revenue","ADR","occupancy_%","checkins","checkouts","cash_pickups","cash_amount"]
         st.dataframe(apt_group[show_cols].sort_values("revenue", ascending=False), use_container_width=True)
 
+        # Ingresos por apartamento (robusto contra tipos/NaN)
         st.markdown("**Ingresos por apartamento**")
+        y = apt_group["apartment"].fillna("—").astype(str)
+        x = pd.to_numeric(apt_group["revenue"], errors="coerce").fillna(0.0)
         fig, ax = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
-        ax.barh(apt_group["apartment"], apt_group["revenue"])
+        ax.barh(y, x)
         ax.set_xlabel("USD"); ax.set_ylabel("Apartamento"); ax.set_title("Ingresos del mes (prorrateados)")
         st.pyplot(fig)
 
+        # Noches por apartamento (robusto contra tipos/NaN)
         st.markdown("**Noches por apartamento**")
+        y2 = apt_group["apartment"].fillna("—").astype(str)
+        x2 = pd.to_numeric(apt_group["nights"], errors="coerce").fillna(0)
         fig2, ax2 = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
-        ax2.barh(apt_group["apartment"], apt_group["nights"])
+        ax2.barh(y2, x2)
         ax2.set_xlabel("Noches"); ax2.set_ylabel("Apartamento"); ax2.set_title("Noches del mes")
         st.pyplot(fig2)
 
+        # Mix de canal
         ch_counts = month_calc.copy()
         ch_counts["has_night"] = ch_counts["overlap_nights"] > 0
         ch_counts = ch_counts[ch_counts["has_night"]]
@@ -812,6 +864,7 @@ with tab2:
             st.markdown("**Mix de canal (reservas con noches en el mes)**")
             st.dataframe(mix.sort_values("reservas", ascending=False), use_container_width=True)
 
+        # Horas promedio
         def _avg_time(series_dt):
             s = series_dt.dropna()
             if s.empty: return None
