@@ -27,7 +27,6 @@ st.caption(f"Zona horaria aplicada: {TZ_NAME}")
 # HELPERS GENERALES
 # ==============================
 def _norm(s: str) -> str:
-    import re, unicodedata
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
     s = s.lower()
     s = re.sub(r"[^a-z0-9]+", "", s)
@@ -66,7 +65,6 @@ def _coerce_time(series):
             if t is not None: return t
         except Exception:
             pass
-        import re
         m = re.match(r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([ap]\.?m\.?)?\s*$", s, flags=re.I)
         if m:
             hh = int(m.group(1)); mm = int(m.group(2)); ss = int(m.group(3) or 0)
@@ -113,7 +111,6 @@ def _parse_money(val):
     if val is None or (isinstance(val, float) and np.isnan(val)): return np.nan
     if isinstance(val, (int, float)): return float(val)
     s = str(val)
-    import re
     if not re.search(r"\d", s): return np.nan
     s = s.replace(" ", "")
     s = re.sub(r"[^\d,.\-]", "", s)
@@ -123,6 +120,24 @@ def _parse_money(val):
         s = s.replace(",", "")
     try: return float(s)
     except Exception: return np.nan
+
+def _is_truthy_text(x):
+    """True si el texto indica que sí hay solicitud (no 'no', 'none', 'n/a', '0')."""
+    s = str(x).strip().lower()
+    if s in ["", "no", "none", "n/a", "na", "0", "false", "sin", "ninguno", "ninguna"]:
+        return False
+    return True
+
+def _parse_parking_count(x):
+    """Intenta extraer cantidad de carros desde la columna PARKING."""
+    if pd.isna(x): return np.nan
+    if isinstance(x, (int, float)) and not np.isnan(x): return int(x)
+    s = str(x).lower()
+    if s in ["", "no", "none", "n/a", "na", "0"]: return 0
+    m = re.search(r"(\d+)", s)
+    if m: return int(m.group(1))
+    # si no hay número pero algo puso, asumimos 1
+    return 1
 
 # ==============================
 # NORMALIZACIÓN (columnas flexibles)
@@ -242,6 +257,47 @@ def filter_day(df: pd.DataFrame, day) -> pd.DataFrame:
     mask = df["checkout"].between(start, end, inclusive="left") | df["checkin"].between(start, end, inclusive="left")
     return df[mask].copy()
 
+def day_summary_collapsed(day_df: pd.DataFrame, day) -> pd.DataFrame:
+    """Una fila por apartamento:
+       Turnover (ambos), Solo Check-Out, Solo Check-In.
+       Múltiples horas se listan separadas por coma.
+    """
+    the_day = pd.Timestamp(day).date()
+    rows = []
+    if day_df.empty: return pd.DataFrame(columns=["apartment","tipo","checkout_time","checkin_time","gap_hours"])
+
+    # Horas por apto
+    def _fmt_list(ts):
+        if not ts: return ""
+        ts = sorted(ts)
+        return ", ".join([t.strftime("%H:%M") for t in ts])
+
+    grouped = {}
+    for _, r in day_df.iterrows():
+        apt = r.get("apartment","Apto")
+        ci  = r.get("checkin", pd.NaT)
+        co  = r.get("checkout", pd.NaT)
+        if apt not in grouped:
+            grouped[apt] = {"ci": [], "co": []}
+        if pd.notna(ci) and ci.date() == the_day: grouped[apt]["ci"].append(ci.tz_convert(TZ_NAME))
+        if pd.notna(co) and co.date() == the_day: grouped[apt]["co"].append(co.tz_convert(TZ_NAME))
+
+    for apt, d in grouped.items():
+        cis, cos = d["ci"], d["co"]
+        if cis and cos:
+            gap = (min(cis) - max(cos)).total_seconds()/3600.0
+            gap = round(gap, 2) if gap > 0 else 0.0
+            rows.append({"apartment": apt, "tipo": "Turnover",
+                         "checkout_time": _fmt_list(cos), "checkin_time": _fmt_list(cis),
+                         "gap_hours": gap})
+        elif cos:
+            rows.append({"apartment": apt, "tipo": "Solo Check-Out",
+                         "checkout_time": _fmt_list(cos), "checkin_time": "", "gap_hours": ""})
+        elif cis:
+            rows.append({"apartment": apt, "tipo": "Solo Check-In",
+                         "checkout_time": "", "checkin_time": _fmt_list(cis), "gap_hours": ""})
+    return pd.DataFrame(rows).sort_values(["tipo","apartment"]).reset_index(drop=True)
+
 def build_apartment_windows(day_df: pd.DataFrame, day, day_start_t: time, day_end_t: time) -> pd.DataFrame:
     the_day = pd.Timestamp(day).date()
     start_of_day = TZ.localize(datetime.combine(the_day, day_start_t))
@@ -256,26 +312,6 @@ def build_apartment_windows(day_df: pd.DataFrame, day, day_start_t: time, day_en
     win = pd.DataFrame(rows)
     if not win.empty: win = win[win["end"] > win["start"]]
     return win
-
-def day_summary(day_df: pd.DataFrame, day) -> pd.DataFrame:
-    the_day = pd.Timestamp(day).date()
-    rows = []
-    for _, r in day_df.iterrows():
-        apt = r.get("apartment","Apto")
-        ci  = r.get("checkin", pd.NaT)
-        co  = r.get("checkout", pd.NaT)
-        is_ci = pd.notna(ci) and ci.date() == the_day
-        is_co = pd.notna(co) and co.date() == the_day
-        ci_str = ci.tz_convert(TZ_NAME).strftime("%H:%M") if is_ci else ""
-        co_str = co.tz_convert(TZ_NAME).strftime("%H:%M") if is_co else ""
-        if is_ci and is_co:
-            gap_hours = round((ci - co).total_seconds() / 3600.0, 2)
-            rows.append({"apartment": apt, "tipo": "Turnover", "checkout_time": co_str, "checkin_time": ci_str, "gap_hours": gap_hours})
-        elif is_co:
-            rows.append({"apartment": apt, "tipo": "Solo Check-Out", "checkout_time": co_str, "checkin_time": "", "gap_hours": ""})
-        elif is_ci:
-            rows.append({"apartment": apt, "tipo": "Solo Check-In",  "checkout_time": "", "checkin_time": ci_str, "gap_hours": ""})
-    return pd.DataFrame(rows)
 
 # ============ Scheduler ============
 class EmployeeTimeline:
@@ -433,6 +469,7 @@ tab1, tab2 = st.tabs(["🧭 Operativa del día", "📈 Analítica mensual"])
 # ====== TAB 1: Operativa del día ======
 with tab1:
     today_str = pd.Timestamp(work_date).strftime("%Y-%m-%d")
+
     st.subheader("📦 Preparación del día (mismo día)")
     prep_df = normalized[(normalized["checkin_day"] == today_str) | (normalized["checkout_day"] == today_str)].copy()
     if prep_df.empty:
@@ -455,9 +492,42 @@ with tab1:
         st.warning("Coordinar recolección en estos apartamentos:")
         st.dataframe(cash_pickups[show_cols], use_container_width=True)
 
+    # 🚐 Transporte (CHECK-IN / CHECK-OUT)
+    st.subheader("🚐 Agendar Transporte (hoy)")
+    trans_df = prep_df.copy()
+    if "transporte" in trans_df.columns:
+        trans_df["needs_transport"] = trans_df["transporte"].apply(_is_truthy_text)
+        t_ci = trans_df[(trans_df["needs_transport"]) & (trans_df["checkin_day"] == today_str)][["apartment","guest_name","checkin_time"]].copy()
+        t_ci["accion"] = "CHECK-IN"
+        t_co = trans_df[(trans_df["needs_transport"]) & (trans_df["checkout_day"] == today_str)][["apartment","guest_name","checkout_time"]].copy()
+        t_co["accion"] = "CHECK-OUT"
+        t_ci.rename(columns={"checkin_time":"hora"}, inplace=True)
+        t_co.rename(columns={"checkout_time":"hora"}, inplace=True)
+        trans_out = pd.concat([t_ci, t_co], ignore_index=True)
+        if trans_out.empty:
+            st.info("No hay transportes para agendar hoy.")
+        else:
+            st.dataframe(trans_out.sort_values(["hora","accion","apartment"]), use_container_width=True)
+    else:
+        st.info("No se encontró columna de Transporte en el archivo.")
+
+    # 🅿️ Parking (cantidad de carros)
+    st.subheader("🅿️ Parking – Check-ins de hoy")
+    park_df = prep_df[prep_df["checkin_day"] == today_str].copy()
+    if "parking" in park_df.columns and not park_df.empty:
+        park_df["carros"] = park_df["parking"].apply(_parse_parking_count)
+        park_out = park_df[["apartment","guest_name","checkin_time","carros","parking"]].rename(columns={"parking":"detalle"})
+        park_out = park_out[park_out["carros"].notna()]
+        if park_out.empty:
+            st.info("No hay solicitudes de parking para hoy.")
+        else:
+            st.dataframe(park_out.sort_values(["checkin_time","apartment"]), use_container_width=True)
+    else:
+        st.info("No hay datos de parking para hoy.")
+
     st.subheader("🧾 Resumen por apartamento (día)")
     day_df = filter_day(normalized, work_date)
-    summary_df = day_summary(day_df, work_date)
+    summary_df = day_summary_collapsed(day_df, work_date)
     if summary_df.empty:
         st.info("No hay resumen para mostrar.")
     else:
@@ -475,8 +545,7 @@ with tab1:
             y = y_map[row["apartment"]]
             start = row["start"].to_pydatetime(); end = row["end"].to_pydatetime()
             left = (start - day0).total_seconds()/3600; width = (end-start).total_seconds()/3600
-            ax.barh(y, width, left=left)
-            ax.text(left+width/2, y, row["kind"], va="center", ha="center", fontsize=9)
+            ax.barh(y, width, left=left); ax.text(left+width/2, y, row["kind"], va="center", ha="center", fontsize=9)
         ax.set_yticks(range(len(apartments))); ax.set_yticklabels(apartments)
         ax.set_xlabel("Horas del día"); ax.set_title("Ventanas libres para limpieza"); st.pyplot(fig)
 
@@ -490,13 +559,11 @@ with tab1:
     st.subheader("🗓️ Plan asignado")
     st.dataframe(plan_df, use_container_width=True)
     if not un_df.empty:
-        st.warning("No se pudieron asignar algunos trabajos:")
-        st.dataframe(un_df, use_container_width=True)
+        st.warning("No se pudieron asignar algunos trabajos:"); st.dataframe(un_df, use_container_width=True)
 
     st.subheader("📊 Visualización del plan (por empleada)")
     if not plan_df.empty:
-        plot_gantt(plan_df.rename(columns={"employee":"label"}).assign(label=lambda d: d["employee"]),
-                   title="Plan de Limpiezas (Gantt)", y_key="label")
+        plot_gantt(plan_df, title="Plan de Limpiezas (Gantt)", y_key="employee")
     else:
         st.info("Sin asignaciones para graficar.")
 
@@ -520,24 +587,20 @@ with tab2:
     next_month = (month_start + pd.offsets.MonthBegin(1))
     month_end = next_month
 
-    # Helpers de análisis
     def _booking_revenue(row):
         v = _parse_money(row.get("amount_due", np.nan))
         if np.isnan(v): v = _parse_money(row.get("total_price", np.nan))
         return v
 
     def _nights_overlap(ci, co, start, end):
-        # ci, co son tz-aware (normalizamos arriba)
         if pd.isna(ci) or pd.isna(co): return 0
         a = max(ci, start); b = min(co, end)
         if b <= a: return 0
         return int((b - a).days)
 
-    # Asegurar tz
     normalized["checkin"]  = to_tz(normalized["checkin"])
     normalized["checkout"] = to_tz(normalized["checkout"])
 
-    # Cálculo por reserva
     rows = []
     for _, r in normalized.iterrows():
         apt = r.get("apartment","Apto")
@@ -546,8 +609,6 @@ with tab2:
         nights_total = int(nights_total) if pd.notna(nights_total) else None
         rev_total = _booking_revenue(r)
         overlap_nights = _nights_overlap(ci, co, month_start, month_end)
-
-        # ADR por reserva (si se conoce)
         nightly_rate = (rev_total / nights_total) if (rev_total and nights_total and nights_total > 0) else np.nan
         rev_in_month = overlap_nights * nightly_rate if not np.isnan(nightly_rate) else (rev_total if overlap_nights>0 and (nights_total in [None,0]) else np.nan)
 
@@ -565,7 +626,6 @@ with tab2:
         })
     month_calc = pd.DataFrame(rows)
 
-    # Agregados por apartamento
     if month_calc.empty:
         st.info("No hay reservas para el mes seleccionado.")
     else:
@@ -581,7 +641,6 @@ with tab2:
         apt_group["ADR"] = (apt_group["revenue"] / apt_group["nights"]).replace([np.inf, -np.inf], np.nan)
         apt_group["occupancy_%"] = (apt_group["nights"] / days_in_month * 100).round(1)
 
-        # KPIs globales
         total_nights = int(apt_group["nights"].sum())
         total_rev = float(apt_group["revenue"].sum())
         adr_global = (total_rev / total_nights) if total_nights > 0 else np.nan
@@ -602,12 +661,10 @@ with tab2:
         show_cols = ["apartment","nights","revenue","ADR","occupancy_%","checkins","checkouts","cash_pickups","cash_amount"]
         st.dataframe(apt_group[show_cols].sort_values("revenue", ascending=False), use_container_width=True)
 
-        # Descarga CSV
         csv_month = apt_group[show_cols].to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Descargar analítica por apartamento (CSV)", data=csv_month,
                            file_name=f"analytics_{month_start.strftime('%Y%m')}.csv", mime="text/csv")
 
-        # Gráficas
         st.markdown("**Ingresos por apartamento**")
         fig, ax = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
         ax.barh(apt_group["apartment"], apt_group["revenue"])
@@ -617,10 +674,9 @@ with tab2:
         st.markdown("**Noches por apartamento**")
         fig2, ax2 = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
         ax2.barh(apt_group["apartment"], apt_group["nights"])
-        ax2.set_xlabel("Noches"); ax2.set_ylabel("Apartamento"); ax2.set.title("Noches del mes")
+        ax2.set_xlabel("Noches"); ax2.set_ylabel("Apartamento"); ax2.set_title("Noches del mes")
         st.pyplot(fig2)
 
-        # Mix de canal (cuenta de reservas con alguna noche en el mes)
         ch_counts = month_calc.copy()
         ch_counts["has_night"] = ch_counts["overlap_nights"] > 0
         ch_counts = ch_counts[ch_counts["has_night"]]
@@ -633,7 +689,6 @@ with tab2:
             ax3.set_xlabel("Reservas"); ax3.set_ylabel("Canal"); ax3.set_title("Mix de Canal")
             st.pyplot(fig3)
 
-        # Promedio de hora de check-in/out (global del mes)
         def _avg_time(series_dt):
             s = series_dt.dropna()
             if s.empty: return None
@@ -643,4 +698,3 @@ with tab2:
         avg_ci = _avg_time(month_calc.loc[month_calc["checkin_in_month"]==1, "checkin_time_dt"])
         avg_co = _avg_time(month_calc.loc[month_calc["checkout_in_month"]==1, "checkout_time_dt"])
         st.markdown(f"**Hora promedio** — Check-in: `{avg_ci or '—'}` • Check-out: `{avg_co or '—'}`")
-
