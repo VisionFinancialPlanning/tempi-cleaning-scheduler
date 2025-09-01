@@ -394,4 +394,109 @@ else:
     try:
         st.info("Usando datos de ejemplo: sample_bookings.xlsx")
         df_raw = pd.read_excel("sample_bookings.xlsx")
-    except Exc
+    except Exception:
+        st.error("No subiste archivo y no se encontró sample_bookings.xlsx en el repo."); st.stop()
+
+st.subheader("📄 Reservas – Original (preview)")
+st.dataframe(df_raw.head(10), use_container_width=True)
+
+try:
+    normalized = parse_bookings_with_fixed_columns(df_raw)
+except Exception as e:
+    st.error(f"Error al normalizar reservas: {e}"); st.stop()
+
+st.success("✅ Reservas normalizadas")
+st.dataframe(normalized, use_container_width=True)
+
+# Descargas normalizado
+csv_bytes = normalized.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Descargar Normalizado (CSV)", data=csv_bytes, file_name="checkins_checkouts.csv", mime="text/csv")
+excel_buf = io.BytesIO()
+with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+    normalized.to_excel(writer, sheet_name="checkins_checkouts", index=False)
+st.download_button("⬇️ Descargar Normalizado (Excel)", data=excel_buf.getvalue(),
+                   file_name="checkins_checkouts.xlsx",
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ==============================
+# PREPARACIÓN (DÍA ANTERIOR)
+# ==============================
+st.header("📦 Preparación (día anterior)")
+prep_df = normalized[ normalized["checkin_day"] == pd.Timestamp(prep_date).strftime("%Y-%m-%d") ].copy()
+if prep_df.empty:
+    st.info("No hay check-ins para la fecha seleccionada de preparación.")
+else:
+    # Bandeja con lo solicitado y flags de CASH
+    cols_show = [c for c in [
+        "apartment","guest_name","number_guests","sofa_or_bed","reservation_id",
+        "transporte","extra","parking","nombre","notes",
+        "channel","payment_method","cash_pickup","cash_reason",
+        "checkin_day","checkin_time"
+    ] if c in prep_df.columns]
+    st.dataframe(prep_df[cols_show], use_container_width=True)
+
+    # Lista de CASH pickup
+    cash_list = prep_df[prep_df.get("cash_pickup", False) == True]  # noqa: E712
+    st.subheader("💵 Recolección de CASH (por Booking/efectivo)")
+    if cash_list.empty:
+        st.success("No hay recolecciones de CASH para esa fecha.")
+    else:
+        st.warning("Revisar y coordinar recolección de CASH en estos apartamentos:")
+        st.dataframe(cash_list[["apartment","guest_name","checkin_time","cash_reason"]], use_container_width=True)
+
+# ==============================
+# DISPONIBILIDAD POR APTO (GANTT)
+# ==============================
+st.subheader("🏠 Ventanas disponibles por apartamento (Gantt)")
+day_df = filter_day(normalized, work_date)
+windows_df = build_apartment_windows(day_df, work_date, day_start_t, day_end_t)
+if windows_df.empty:
+    st.info("No hay ventanas disponibles para el día seleccionado.")
+else:
+    fig, ax = plt.subplots(figsize=(11, 3 + 0.35*len(windows_df)))
+    apartments = list(windows_df["apartment"].unique()); y_map = {a:i for i,a in enumerate(apartments)}
+    day0 = windows_df["start"].iloc[0].replace(hour=0, minute=0, second=0, microsecond=0)
+    for _, row in windows_df.iterrows():
+        y = y_map[row["apartment"]]
+        start = row["start"].to_pydatetime(); end = row["end"].to_pydatetime()
+        left = (start - day0).total_seconds()/3600; width = (end-start).total_seconds()/3600
+        ax.barh(y, width, left=left)
+        ax.text(left+width/2, y, row["kind"], va="center", ha="center", fontsize=9)
+    ax.set_yticks(range(len(apartments))); ax.set_yticklabels(apartments)
+    ax.set_xlabel("Horas del día"); ax.set_title("Ventanas libres para limpieza"); st.pyplot(fig)
+
+# ==============================
+# PLANIFICACIÓN / ASIGNACIÓN
+# ==============================
+st.header("🧭 Horario de Limpieza (asignación)")
+jobs_df = build_cleaning_jobs(day_df, work_date, default_duration, pd.DataFrame(), mop_minutes, day_start_t, day_end_t)
+st.subheader("🧱 Trabajos a programar"); st.dataframe(jobs_df, use_container_width=True)
+
+e1 = EmployeeTimeline(emp1_name, e1_start, e1_end, e1_l1, e1_l2, work_date)
+e2 = EmployeeTimeline(emp2_name, e2_start, e2_end, e2_l1, e2_l2, work_date)
+plan_df, un_df = greedy_assign(jobs_df, [e1, e2], buffer_min=buffer_minutes, travel_min=travel_minutes, early_priority=early_priority)
+
+st.subheader("🗓️ Plan asignado"); st.dataframe(plan_df, use_container_width=True)
+if not un_df.empty:
+    st.warning("No se pudieron asignar algunos trabajos:"); st.dataframe(un_df, use_container_width=True)
+
+st.subheader("📊 Visualización del plan (por empleada)")
+if not plan_df.empty:
+    plot_gantt(plan_df.rename(columns={"employee":"label"}).assign(label=lambda d: d["employee"]), "Plan de Limpiezas (Gantt)", "label")
+else:
+    st.info("Sin asignaciones para graficar.")
+
+st.subheader("📲 Resumen para WhatsApp")
+if plan_df.empty:
+    st.code("(Sin asignaciones)")
+else:
+    lines = ["*Plan de Limpiezas* 🧼"]
+    for emp in plan_df["employee"].unique():
+        lines.append(f"\n*{emp}*")
+        sub = plan_df[plan_df["employee"] == emp]
+        for _, r in sub.sort_values("start").iterrows():
+            lines.append(f"• {r['apartment']} — {r['start'].strftime('%H:%M')}–{r['end'].strftime('%H:%M')} ({int(r['duration_min'])}m)")
+    st.code("\n".join(lines))
+
+plan_csv = plan_df.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Descargar plan (CSV)", data=plan_csv, file_name=f"plan_{work_date}.csv", mime="text/csv")
