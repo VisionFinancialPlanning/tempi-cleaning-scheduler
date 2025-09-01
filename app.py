@@ -2,14 +2,14 @@
 import os
 os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
 
-import io, unicodedata, re
+import re, unicodedata
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, time
 import pytz
 from pandas.api.types import is_datetime64_any_dtype as _is_dt
 
@@ -24,7 +24,7 @@ st.title("Tempi – Scheduler & Bookings 🧹📒")
 st.caption(f"Zona horaria aplicada: {TZ_NAME}")
 
 # ==============================
-# HELPERS GENERALES
+# HELPERS
 # ==============================
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
@@ -97,8 +97,10 @@ def _combine_smart(date_s, explicit_time_s, default_time: time):
             out.append(pd.Timestamp.combine(pd.Timestamp(d).date(), tt))
     ser = pd.to_datetime(out, errors="coerce")
     if ser.empty or not _is_dt(ser): return ser
-    try: ser = ser.dt.tz_localize(TZ_NAME, nonexistent="NaT", ambiguous="NaT")
-    except Exception: return ser
+    try:
+        ser = ser.dt.tz_localize(TZ_NAME, nonexistent="NaT", ambiguous="NaT")
+    except Exception:
+        return ser
     return ser
 
 def _fmt_tz(series, fmt):
@@ -121,12 +123,6 @@ def _parse_money(val):
     try: return float(s)
     except Exception: return np.nan
 
-def _is_truthy_text(x):
-    s = str(x).strip().lower()
-    if s in ["", "no", "none", "n/a", "na", "0", "false", "sin", "ninguno", "ninguna"]:
-        return False
-    return True
-
 def _parse_parking_count(x):
     if pd.isna(x): return np.nan
     if isinstance(x, (int, float)) and not np.isnan(x): return int(x)
@@ -137,7 +133,7 @@ def _parse_parking_count(x):
     return 1
 
 def _is_si(x):
-    """True solo si la celda dice SI/Sí/si (o yes)."""
+    """True solo si la celda dice 'SI' (acepta Sí/si/yes)."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return False
     s = str(x).strip().lower().replace("í", "i")
@@ -277,6 +273,7 @@ def filter_day(df: pd.DataFrame, day) -> pd.DataFrame:
     return df[mask].copy()
 
 def day_summary_collapsed(day_df: pd.DataFrame, day) -> pd.DataFrame:
+    """Una fila por apartamento; Turnover, Solo Check-Out, Solo Check-In."""
     the_day = pd.Timestamp(day).date()
     rows = []
     if day_df.empty: return pd.DataFrame(columns=["apartment","tipo","checkout_time","checkin_time","gap_hours"])
@@ -421,7 +418,7 @@ def plot_gantt(df: pd.DataFrame, title, y_key):
     ax.set_xlabel("Horas del día"); ax.set_title(title); st.pyplot(fig)
 
 # ==============================
-# SIDEBAR (una sola fecha)
+# SIDEBAR
 # ==============================
 with st.sidebar:
     st.header("⚙️ Configuración del Día")
@@ -455,7 +452,7 @@ with st.sidebar:
     early_priority  = st.checkbox("Priorizar salidas tempranas (deadline primero)", value=True)
 
 # ==============================
-# CARGA ARCHIVO (sin previews)
+# CARGA ARCHIVO
 # ==============================
 uploaded = st.file_uploader(
     "Sube tu Excel (.xlsx). Requeridas: 'Check-In', 'Check-Out' (horas con alias aceptados).",
@@ -506,25 +503,40 @@ with tab1:
         st.warning("Coordinar recolección en estos apartamentos:")
         st.dataframe(cash_pickups[show_cols], use_container_width=True)
 
-    # 🚐 Agendar Transporte (hoy) — SOLO si las columnas dicen "SI"
+    # 🚐 Agendar Transporte (hoy) — SOLO si la columna correspondiente dice "SI"
     st.subheader("🚐 Agendar Transporte (hoy)")
     trans_df = prep_df.copy()
     has_ci = "transport_ci" in trans_df.columns
     has_co = "transport_co" in trans_df.columns
+
+    def _hora_from_cols(row, kind):
+        if kind == "ci":
+            if "checkin_time" in row and pd.notna(row["checkin_time"]) and str(row["checkin_time"]).strip():
+                return row["checkin_time"]
+            if "checkin" in row and pd.notna(row["checkin"]):
+                try: return row["checkin"].tz_convert(TZ_NAME).strftime("%H:%M")
+                except Exception: return pd.to_datetime(row["checkin"]).strftime("%H:%M")
+        else:
+            if "checkout_time" in row and pd.notna(row["checkout_time"]) and str(row["checkout_time"]).strip():
+                return row["checkout_time"]
+            if "checkout" in row and pd.notna(row["checkout"]):
+                try: return row["checkout"].tz_convert(TZ_NAME).strftime("%H:%M")
+                except Exception: return pd.to_datetime(row["checkout"]).strftime("%H:%M")
+        return ""
+
     if has_ci or has_co:
-        t_ci = pd.DataFrame()
-        t_co = pd.DataFrame()
+        out_rows = []
         if has_ci:
-            t_ci = trans_df[trans_df["checkin_day"] == today_str].copy()
-            t_ci = t_ci[t_ci["transport_ci"].apply(_is_si)]
-            t_ci = t_ci[["apartment","guest_name","checkin_time"]]
-            t_ci["accion"] = "CHECK-IN"; t_ci.rename(columns={"checkin_time":"hora"}, inplace=True)
+            df_ci = trans_df[(trans_df["checkin_day"] == today_str) & (trans_df["transport_ci"].apply(_is_si))].copy()
+            for _, r in df_ci.iterrows():
+                out_rows.append({"hora": _hora_from_cols(r, "ci"), "accion": "CHECK-IN",
+                                 "apartment": r.get("apartment",""), "guest_name": r.get("guest_name","")})
         if has_co:
-            t_co = trans_df[trans_df["checkout_day"] == today_str].copy()
-            t_co = t_co[t_co["transport_co"].apply(_is_si)]
-            t_co = t_co[["apartment","guest_name","checkout_time"]]
-            t_co["accion"] = "CHECK-OUT"; t_co.rename(columns={"checkout_time":"hora"}, inplace=True)
-        trans_out = pd.concat([t_ci, t_co], ignore_index=True)
+            df_co = trans_df[(trans_df["checkout_day"] == today_str) & (trans_df["transport_co"].apply(_is_si))].copy()
+            for _, r in df_co.iterrows():
+                out_rows.append({"hora": _hora_from_cols(r, "co"), "accion": "CHECK-OUT",
+                                 "apartment": r.get("apartment",""), "guest_name": r.get("guest_name","")})
+        trans_out = pd.DataFrame(out_rows, columns=["hora","accion","apartment","guest_name"])
         if trans_out.empty:
             st.info("No hay transportes para agendar hoy.")
         else:
@@ -580,7 +592,8 @@ with tab1:
     st.subheader("🗓️ Plan asignado")
     st.dataframe(plan_df, use_container_width=True)
     if not un_df.empty:
-        st.warning("No se pudieron asignar algunos trabajos:"); st.dataframe(un_df, use_container_width=True)
+        st.warning("No se pudieron asignar algunos trabajos:")
+        st.dataframe(un_df, use_container_width=True)
 
     st.subheader("📊 Visualización del plan (por empleada)")
     if not plan_df.empty:
