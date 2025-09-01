@@ -1,4 +1,8 @@
-apartment,beds,bath,has_sofabed,base_minutes,linen_change
-La Cuadra 2D,1,1,1,90,1
-Jerónimo 3A,2,2,1,120,1
-Catedral 4B,1,1,0,90,1
+apartment;beds;bath;has_sofabed;base_minutes;linen_change
+Catedral;1;1.5;1;90;1
+Jeronimo;1;1.5;1;90;1
+202;1;1;1;90;1
+204;3;2;1;120;1
+304;3;2;1;120;1
+104;3;2;1;120;1
+La Cuadra 2D;1;1;1;90;1
