@@ -59,11 +59,8 @@ def _combine(date_s, time_s, default_time: time):
             out.append(pd.Timestamp.combine(pd.Timestamp(d).date(), t))
     ser = pd.to_datetime(out, errors="coerce")
 
-    # Si no es datetime o está vacío, regresamos tal cual
     if ser.empty or not _is_dt(ser):
         return ser
-
-    # Intentar localizar a TZ; si falla, devolver naive
     try:
         ser = ser.dt.tz_localize(TZ_NAME, nonexistent="NaT", ambiguous="NaT")
     except Exception:
@@ -72,11 +69,16 @@ def _combine(date_s, time_s, default_time: time):
 
 def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Usa nombres EXACTOS:
+    Usa nombres EXACTOS para fechas/horas:
       - Check-In (fecha)
       - Check-In Hora (hora) [opcional]
       - Check-Out (fecha)
       - Check-Out Hora (hora) [opcional]
+
+    Además:
+      - 'Property Internal Name' -> apartment
+      - 'Guest First Name' -> guest_name
+
     Si faltan horas, aplica CI=15:00 / CO=12:00.
     """
     missing_dates = [c for c in ["Check-In", "Check-Out"] if c not in df.columns]
@@ -100,9 +102,20 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame()
 
-    # Mantener columnas útiles si existen
-    for optional in ["apartment", "unit_id", "guest_name", "Apartamento", "Unidad", "Huésped"]:
-        if optional in df.columns:
+    # Mapear columnas de interés a nombres estándar
+    if "Property Internal Name" in df.columns:
+        out["apartment"] = df["Property Internal Name"].astype(str)
+    elif "apartment" in df.columns:
+        out["apartment"] = df["apartment"].astype(str)
+
+    if "Guest First Name" in df.columns:
+        out["guest_name"] = df["Guest First Name"].astype(str)
+    elif "guest_name" in df.columns:
+        out["guest_name"] = df["guest_name"].astype(str)
+
+    # Campos adicionales si existen
+    for optional in ["unit_id", "Apartamento", "Unidad", "Huésped"]:
+        if optional in df.columns and optional not in out.columns:
             out[optional] = df[optional]
 
     out["checkin"] = ci_dt
@@ -114,7 +127,6 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
             return series.dt.tz_convert(TZ_NAME).dt.strftime(fmt)
         except Exception:
             try:
-                # Si viene naive
                 return series.dt.strftime(fmt)
             except Exception:
                 return pd.Series([""] * len(series))
@@ -124,7 +136,7 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["checkout_day"] = _tz_fmt(out["checkout"], "%Y-%m-%d")
     out["checkout_time"] = _tz_fmt(out["checkout"], "%H:%M")
 
-    # Noches (intenta con tz y fallback sin tz)
+    # Noches
     try:
         nights = (
             out["checkout"].dt.tz_convert(TZ_NAME).dt.date
@@ -348,9 +360,10 @@ with st.sidebar:
     e1_start, e1_end = shift_block("Empleado 1", time(8,0), time(17,0))
     e2_start, e2_end = shift_block("Empleado 2", time(8,0), time(17,0))
 
-    st.subheader("Almuerzo")
-    e1_l1, e1_l2 = shift_block("Empleado 1 – Almuerzo", time(12,0), time(13,0))
-    e2_l1, e2_l2 = shift_block("Empleado 2 – Almuerzo", time(12,30), time(13,30))
+    st.subheader("Almuerzo (movible)")
+    # Por defecto 11:00–12:00 m.d., pero el usuario puede moverlo
+    e1_l1, e1_l2 = shift_block("Empleado 1 – Almuerzo", time(11,0), time(12,0))
+    e2_l1, e2_l2 = shift_block("Empleado 2 – Almuerzo", time(11,0), time(12,0))
 
     st.subheader("Parámetros del Plan")
     buffer_minutes = st.number_input("Buffer entre limpiezas (min)", value=10, step=5)
@@ -363,7 +376,7 @@ with st.sidebar:
 # CARGA → NORMALIZA → SCHEDULER (UN SOLO FLUJO)
 # ==============================
 uploaded = st.file_uploader(
-    "Sube tu Excel de reservas (.xlsx). Requeridas: 'Check-In', 'Check-Out'. Opcionales: 'Check-In Hora', 'Check-Out Hora'",
+    "Sube tu Excel de reservas (.xlsx). Requeridas: 'Check-In', 'Check-Out'. Opcionales: 'Check-In Hora', 'Check-Out Hora', 'Property Internal Name', 'Guest First Name'",
     type=["xlsx"]
 )
 
@@ -381,7 +394,7 @@ else:
 st.subheader("📄 Reservas – Original (preview)")
 st.dataframe(df_raw.head(10), use_container_width=True)
 
-# Normalizar (con tus columnas exactas)
+# Normalizar (con tus columnas exactas + mapeo apartment/guest_name)
 try:
     normalized = parse_bookings_with_fixed_columns(df_raw)
 except Exception as e:
