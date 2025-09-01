@@ -27,25 +27,57 @@ st.caption(f"Zona horaria aplicada: {TZ_NAME}")
 # HELPERS DE FECHA/HORA
 # ==============================
 def _coerce_time(series):
-    """Convierte distintos formatos de hora a time() (o None)."""
+    """Convierte formatos variados de hora a datetime.time o None.
+       Soporta strings, Timestamp, y valores numéricos/fracciones de Excel."""
     if series is None:
         return pd.Series(dtype="object")
+
     def parse_one(v):
         if pd.isna(v):
             return None
+
+        # Timestamp / datetime
         if isinstance(v, (pd.Timestamp, datetime)):
             return v.time()
+
+        # Números (Excel): 0..1 fracción del día; >1 considerar fracción
+        if isinstance(v, (int, float)):
+            try:
+                frac = float(v) % 1.0
+                secs = int(round(frac * 24 * 3600))
+                hh = secs // 3600
+                mm = (secs % 3600) // 60
+                ss = secs % 60
+                return time(hh % 24, mm, ss)
+            except Exception:
+                return None
+
+        # Strings: normalizar y dejar que pandas intente
+        s = str(v).strip().replace(".", ":")
         try:
-            return pd.to_datetime(str(v), errors="coerce").time()
+            t = pd.to_datetime(s, errors="coerce").time()
+            if t is not None:
+                return t
         except Exception:
-            return None
+            pass
+
+        # Regex fallback hh:mm(:ss) con am/pm opcional
+        import re
+        m = re.match(r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([ap]\.?m\.?)?\s*$", s, flags=re.I)
+        if m:
+            hh = int(m.group(1)); mm = int(m.group(2)); ss = int(m.group(3) or 0)
+            ampm = (m.group(4) or "").lower()
+            if ampm.startswith("p") and hh < 12: hh += 12
+            if ampm.startswith("a") and hh == 12: hh = 0
+            return time(hh % 24, mm, ss)
+
+        return None
+
     return series.apply(parse_one)
 
 def _combine(date_s, time_s, default_time: time):
-    """
-    Combina fecha (obligatoria) + hora (opcional). Si la hora falta, usa default_time.
-    Devuelve Serie datetime; intenta localizar a America/Panama sin romper si falla.
-    """
+    """Combina fecha (obligatoria) + hora (opcional).
+       Si falta hora, usa default_time. Localiza a TZ si es posible (seguro)."""
     dates = pd.to_datetime(date_s, errors="coerce")
     times = _coerce_time(time_s) if time_s is not None else pd.Series([None] * len(dates))
 
@@ -68,51 +100,51 @@ def _combine(date_s, time_s, default_time: time):
     return ser
 
 # ==============================
-# NORMALIZACIÓN DE RESERVAS (tus columnas exactas)
+# NORMALIZACIÓN DE RESERVAS
 # ==============================
+def _pick_first_column(df, aliases):
+    """Devuelve el primer nombre de columna existente en df que coincida con la lista de aliases."""
+    for name in aliases:
+        if name in df.columns:
+            return name
+    return None
+
 def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Usa nombres EXACTOS:
-      - Check-In (fecha)
-      - Check-In Hora (hora) [opcional]
-      - Check-Out (fecha)
-      - Check-Out Hora (hora) [opcional]
-      - Property Internal Name -> apartment
-      - Guest First Name -> guest_name
-    Si faltan horas, aplica CI=15:00 / CO=12:00 (y marca el origen).
+    Lee usando nombres EXACTOS + ALIAS:
+      - Fecha Check-In:  'Check-In'   (obligatoria)
+      - Hora Check-In:   uno de ['Check-In Hora','hora entrada','Hora Entrada','Hora Check In','Check-In Time'] (opcional)
+      - Fecha Check-Out: 'Check-Out'  (obligatoria)
+      - Hora Check-Out:  uno de ['Check-Out Hora','hora salida','Hora Salida','Hora Check Out','Check-Out Time'] (opcional)
+      - apartment <- 'Property Internal Name'
+      - guest_name <- 'Guest First Name'
+    Solo pone 15:00/12:00 cuando la hora falta.
     """
-    missing_dates = [c for c in ["Check-In", "Check-Out"] if c not in df.columns]
-    if missing_dates:
-        raise ValueError("Faltan columnas obligatorias: " + ", ".join(missing_dates))
+    if "Check-In" not in df.columns or "Check-Out" not in df.columns:
+        raise ValueError("El archivo debe incluir al menos las columnas 'Check-In' y 'Check-Out'.")
 
-    has_ci_time = "Check-In Hora" in df.columns
-    has_co_time = "Check-Out Hora" in df.columns
+    ci_time_col = _pick_first_column(df, ["Check-In Hora","hora entrada","Hora Entrada","Hora Check In","Check-In Time"])
+    co_time_col = _pick_first_column(df, ["Check-Out Hora","hora salida","Hora Salida","Hora Check Out","Check-Out Time"])
 
-    ci_time_parsed = _coerce_time(df["Check-In Hora"]) if has_ci_time else pd.Series([None]*len(df))
-    co_time_parsed = _coerce_time(df["Check-Out Hora"]) if has_co_time else pd.Series([None]*len(df))
-    ci_used_default = ci_time_parsed.isna()
-    co_used_default = co_time_parsed.isna()
+    ci_dt = _combine(df["Check-In"], df[ci_time_col] if ci_time_col else None, default_time=time(15, 0))
+    co_dt = _combine(df["Check-Out"], df[co_time_col] if co_time_col else None, default_time=time(12, 0))
 
-    ci_dt = _combine(df["Check-In"], df["Check-In Hora"] if has_ci_time else None, default_time=time(15, 0))
-    co_dt = _combine(df["Check-Out"], df["Check-Out Hora"] if has_co_time else None, default_time=time(12, 0))
+    # Para indicadores de origen
+    ci_used_default = _coerce_time(df[ci_time_col]).isna() if ci_time_col else pd.Series([True]*len(df))
+    co_used_default = _coerce_time(df[co_time_col]).isna() if co_time_col else pd.Series([True]*len(df))
 
     out = pd.DataFrame()
 
-    # Mapeo apartment / guest
+    # apartment & guest_name
     if "Property Internal Name" in df.columns:
         out["apartment"] = df["Property Internal Name"].astype(str)
-    elif "apartment" in df.columns:
-        out["apartment"] = df["apartment"].astype(str)
-
     if "Guest First Name" in df.columns:
         out["guest_name"] = df["Guest First Name"].astype(str)
-    elif "guest_name" in df.columns:
-        out["guest_name"] = df["guest_name"].astype(str)
 
     out["checkin"] = ci_dt
     out["checkout"] = co_dt
 
-    # Derivadas (robustas si falta tz)
+    # Derivadas amigables
     def _tz_fmt(series, fmt):
         try:
             return series.dt.tz_convert(TZ_NAME).dt.strftime(fmt)
@@ -134,32 +166,29 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
         nights = pd.to_datetime(out["checkout"], errors="coerce").dt.date - pd.to_datetime(out["checkin"], errors="coerce").dt.date
     out["nights"] = [d.days if pd.notna(d) else None for d in nights]
 
-    # Indicadores de origen de hora
     out["checkin_time_source"] = np.where(ci_used_default, "default 15:00", "archivo")
     out["checkout_time_source"] = np.where(co_used_default, "default 12:00", "archivo")
 
     preferred = [
-        "apartment", "guest_name",
-        "checkin_day", "checkin_time", "checkin_time_source",
-        "checkout_day", "checkout_time", "checkout_time_source",
-        "nights", "checkin", "checkout",
+        "apartment","guest_name",
+        "checkin_day","checkin_time","checkin_time_source",
+        "checkout_day","checkout_time","checkout_time_source",
+        "nights","checkin","checkout",
     ]
     cols = [c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]
     return out[cols]
 
 # ==============================
-# SCHEDULER
+# SCHEDULER Y DISPONIBILIDAD
 # ==============================
 @st.cache_data
 def load_apartment_config():
-    """Carga apartment_config.csv si existe; si no, DataFrame vacío."""
     try:
         return pd.read_csv("apartment_config.csv")
     except Exception:
         return pd.DataFrame()
 
 def to_tz(series: pd.Series) -> pd.Series:
-    """Convierte serie a datetime TZ; si ya trae tz, intenta convertir; si no, localiza."""
     s = pd.to_datetime(series, errors="coerce")
     try:
         s = s.dt.tz_convert(TZ_NAME)
@@ -171,39 +200,35 @@ def to_tz(series: pd.Series) -> pd.Series:
     return s
 
 def filter_day(df: pd.DataFrame, day) -> pd.DataFrame:
-    """Filtra reservas cuyo check-out o check-in caen en el día indicado."""
     start = pd.Timestamp(day, tz=TZ)
     end = start + pd.Timedelta(days=1)
     if "checkout" in df.columns:
         df["checkout"] = to_tz(df["checkout"])
     if "checkin" in df.columns:
         df["checkin"] = to_tz(df["checkin"])
-    mask = (
-        (df["checkout"].between(start, end, inclusive="left")) |
-        (df["checkin"].between(start, end, inclusive="left"))
-    )
+    mask = (df["checkout"].between(start, end, inclusive="left")) | (df["checkin"].between(start, end, inclusive="left"))
     return df[mask].copy()
 
 def infer_duration(row, default_duration, cfg):
-    """Duración: por fila (clean_duration_minutes), por apto (apartment_config), o default."""
     if "clean_duration_minutes" in row and pd.notna(row["clean_duration_minutes"]):
         return int(row["clean_duration_minutes"])
     if cfg is not None and not cfg.empty and "apartment" in cfg.columns:
-        apt_name = str(row.get("apartment", "")).strip().lower()
+        apt_name = str(row.get("apartment","")).strip().lower()
         hit = cfg[cfg["apartment"].astype(str).str.lower() == apt_name]
         if not hit.empty:
             return int(hit.iloc[0].get("base_minutes", default_duration))
     return default_duration
 
-def build_cleaning_jobs(day_df: pd.DataFrame, day, default_duration: int, cfg: pd.DataFrame, mop_minutes: int) -> pd.DataFrame:
-    """
-    Reglas:
-      - Turnover (checkout & checkin hoy) -> limpieza completa (deadline = checkin)
-      - Solo checkout hoy -> limpieza completa
-      - Solo checkin hoy -> mopa rápida (mop_minutes), deadline = checkin
+def build_cleaning_jobs(day_df: pd.DataFrame, day, default_duration: int, cfg: pd.DataFrame, mop_minutes: int,
+                        day_start_t: time, day_end_t: time) -> pd.DataFrame:
+    """Reglas:
+       - Turnover (checkout & checkin hoy): limpieza completa (deadline = checkin)
+       - Solo checkout hoy: limpieza completa
+       - Solo checkin hoy: mopa rápida (mop_minutes), deadline = checkin
     """
     jobs = []
     the_day = pd.Timestamp(day).date()
+    start_of_day = TZ.localize(datetime.combine(the_day, day_start_t))
 
     for _, row in day_df.iterrows():
         apt = row.get("apartment", "Apto")
@@ -226,7 +251,7 @@ def build_cleaning_jobs(day_df: pd.DataFrame, day, default_duration: int, cfg: p
             deadline = pd.NaT
         elif is_checkin_today:
             duration = int(mop_minutes)
-            start_window = TZ.localize(datetime.combine(the_day, time(8, 0)))
+            start_window = start_of_day
             deadline = checkin
         else:
             continue
@@ -240,6 +265,32 @@ def build_cleaning_jobs(day_df: pd.DataFrame, day, default_duration: int, cfg: p
             "duration_min": int(duration),
         })
     return pd.DataFrame(jobs)
+
+def build_apartment_windows(day_df: pd.DataFrame, day, day_start_t: time, day_end_t: time) -> pd.DataFrame:
+    """Ventanas disponibles por apartamento para limpiar en el día."""
+    the_day = pd.Timestamp(day).date()
+    start_of_day = TZ.localize(datetime.combine(the_day, day_start_t))
+    end_of_day = TZ.localize(datetime.combine(the_day, day_end_t))
+
+    rows = []
+    for _, r in day_df.iterrows():
+        apt = r.get("apartment", "Apto")
+        ci = r.get("checkin", pd.NaT)
+        co = r.get("checkout", pd.NaT)
+
+        is_ci = pd.notna(ci) and ci.date() == the_day
+        is_co = pd.notna(co) and co.date() == the_day
+
+        if is_co and is_ci:
+            rows.append({"apartment": apt, "start": co, "end": ci, "kind": "turnover"})
+        elif is_co:
+            rows.append({"apartment": apt, "start": co, "end": end_of_day, "kind": "solo checkout"})
+        elif is_ci:
+            rows.append({"apartment": apt, "start": start_of_day, "end": ci, "kind": "solo check-in (mopa)"})
+    win = pd.DataFrame(rows)
+    if not win.empty:
+        win = win[win["end"] > win["start"]]
+    return win
 
 class EmployeeTimeline:
     def __init__(self, name, start_t: time, end_t: time, lunch_start: time, lunch_end: time, day):
@@ -311,38 +362,29 @@ def greedy_assign(jobs_df, employees, buffer_min=10, travel_min=0, early_priorit
 
     return pd.DataFrame(assignments), pd.DataFrame(unassigned)
 
-def plot_gantt(plan_df: pd.DataFrame):
+def plot_gantt(plan_df: pd.DataFrame, title="Plan de Limpiezas (Gantt)", y_label="Empleadas"):
     if plan_df is None or plan_df.empty:
-        st.info("No hay asignaciones para mostrar.")
+        st.info("No hay datos para mostrar.")
         return
     fig, ax = plt.subplots(figsize=(11, 3 + 0.35*len(plan_df)))
-    employees = list(plan_df["employee"].unique())
-    y_map = {e: i for i, e in enumerate(employees)}
-    day0 = plan_df["start"].iloc[0].replace(hour=0, minute=0, second=0, microsecond=0)
+    labels = list(plan_df.iloc[:,0].unique()) if "employee" not in plan_df.columns else list(plan_df["employee"].unique())
+    y_map = {e: i for i, e in enumerate(labels)}
+    day0 = plan_df.iloc[0]["start"].replace(hour=0, minute=0, second=0, microsecond=0)
     for _, row in plan_df.iterrows():
-        y = y_map[row["employee"]]
+        y = y_map[row[list(y_map.keys())[0].__class__.__name__.lower()] if False else row.get("employee", row.get("apartment"))]  # noqa: trick to avoid static checkers
+        y = y_map[row["employee"]] if "employee" in row else y_map[row["apartment"]]
         start = row["start"].to_pydatetime()
         end = row["end"].to_pydatetime()
         left = (start - day0).total_seconds() / 3600
         width = (end - start).total_seconds() / 3600
         ax.barh(y, width, left=left)
-        ax.text(left + width/2, y, f"{row['apartment']}", va="center", ha="center", fontsize=9)
-    ax.set_yticks(range(len(employees)))
-    ax.set_yticklabels(employees)
+        label = row.get("apartment", row.get("employee", ""))
+        ax.text(left + width/2, y, f"{label}", va="center", ha="center", fontsize=9)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels)
     ax.set_xlabel("Horas del día")
-    ax.set_title("Plan de Limpiezas (Gantt)")
+    ax.set_title(title)
     st.pyplot(fig)
-
-def whatsapp_summary(plan_df: pd.DataFrame) -> str:
-    if plan_df is None or plan_df.empty:
-        return "(Sin asignaciones)"
-    lines = ["*Plan de Limpiezas* 🧼"]
-    for emp in plan_df["employee"].unique():
-        lines.append(f"\n*{emp}*")
-        sub = plan_df[plan_df["employee"] == emp]
-        for _, r in sub.sort_values("start").iterrows():
-            lines.append(f"• {r['apartment']} — {r['start'].strftime('%H:%M')}–{r['end'].strftime('%H:%M')} ({int(r['duration_min'])}m)")
-    return "\n".join(lines)
 
 # ==============================
 # SIDEBAR – PARÁMETROS
@@ -350,6 +392,10 @@ def whatsapp_summary(plan_df: pd.DataFrame) -> str:
 with st.sidebar:
     st.header("⚙️ Configuración del Día")
     work_date = st.date_input("Día a planificar", value=pd.Timestamp.now(TZ).date())
+
+    st.subheader("Jornada operativa")
+    day_start_t = st.time_input("Inicio del día", value=time(8,0))
+    day_end_t   = st.time_input("Fin del día", value=time(18,0))
 
     st.subheader("Empleadas")
     emp1_name = st.text_input("Empleado 1", value="Mayerlin")
@@ -376,13 +422,12 @@ with st.sidebar:
     default_duration = st.number_input("Duración limpieza completa (min)", value=90, step=5)
     mop_minutes = st.number_input("Duración mopa (solo check-in) (min)", value=20, step=5)
     early_priority = st.checkbox("Priorizar salidas tempranas (deadline primero)", value=True)
-    use_apt_cfg = st.checkbox("Usar apartment_config.csv (tiempos por apto)", value=True)
 
 # ==============================
-# CARGA → NORMALIZA → SCHEDULER (UN SOLO FLUJO)
+# CARGA → NORMALIZA → SCHEDULER
 # ==============================
 uploaded = st.file_uploader(
-    "Sube tu Excel (.xlsx) con: 'Check-In', 'Check-Out' (obligatorias) y opcionales 'Check-In Hora', 'Check-Out Hora', 'Property Internal Name', 'Guest First Name'",
+    "Sube tu Excel (.xlsx) con: 'Check-In', 'Check-Out' (obligatorias) + opcionales 'Check-In Hora'/'hora entrada' y 'Check-Out Hora'/'hora salida'.",
     type=["xlsx"]
 )
 
@@ -413,7 +458,7 @@ if "checkin_time_source" in normalized.columns and "checkout_time_source" in nor
     if pct_ci_def > 50 or pct_co_def > 50:
         st.warning(
             f"Muchas horas vienen por defecto (Check-In {pct_ci_def:.0f}%, Check-Out {pct_co_def:.0f}%). "
-            "Revisa que 'Check-In Hora' y 'Check-Out Hora' tengan valores en el Excel."
+            "Revisa que las columnas de hora del Excel tengan valores."
         )
 
 st.success("✅ Reservas normalizadas")
@@ -434,25 +479,45 @@ st.download_button(
 )
 
 # ==============================
-# Construcción de trabajos y asignación
+# DISPONIBILIDAD POR APARTAMENTO (NUEVO GANTT)
 # ==============================
-st.header("🧭 Horario de Limpieza")
-
-apt_cfg = load_apartment_config() if use_apt_cfg else pd.DataFrame()
-
-# Filtrar por día seleccionado
+st.subheader("🏠 Ventanas disponibles por apartamento (Gantt)")
 day_df = filter_day(normalized, work_date)
-st.subheader("📄 Reservas del día (normalizadas)")
-st.dataframe(day_df, use_container_width=True)
+windows_df = build_apartment_windows(day_df, work_date, day_start_t, day_end_t)
+if windows_df.empty:
+    st.info("No hay ventanas disponibles para el día seleccionado.")
+else:
+    # Plot por apartamento
+    fig, ax = plt.subplots(figsize=(11, 3 + 0.35*len(windows_df)))
+    apartments = list(windows_df["apartment"].unique())
+    y_map = {a: i for i, a in enumerate(apartments)}
+    day0 = windows_df["start"].iloc[0].replace(hour=0, minute=0, second=0, microsecond=0)
+    for _, row in windows_df.iterrows():
+        y = y_map[row["apartment"]]
+        start = row["start"].to_pydatetime()
+        end = row["end"].to_pydatetime()
+        left = (start - day0).total_seconds() / 3600
+        width = (end - start).total_seconds() / 3600
+        ax.barh(y, width, left=left)
+        ax.text(left + width/2, y, row["kind"], va="center", ha="center", fontsize=9)
+    ax.set_yticks(range(len(apartments)))
+    ax.set_yticklabels(apartments)
+    ax.set_xlabel("Horas del día")
+    ax.set_title("Ventanas libres para limpieza")
+    st.pyplot(fig)
 
-# Generar trabajos con tus reglas
-jobs_df = build_cleaning_jobs(day_df, work_date, default_duration, apt_cfg, mop_minutes)
+# ==============================
+# PLANIFICACIÓN / ASIGNACIÓN
+# ==============================
+st.header("🧭 Horario de Limpieza (asignación)")
+
+jobs_df = build_cleaning_jobs(day_df, work_date, default_duration, pd.DataFrame(), mop_minutes, day_start_t, day_end_t)
 st.subheader("🧱 Trabajos a programar")
 st.dataframe(jobs_df, use_container_width=True)
 
 # Timelines / Empleadas
-e1 = EmployeeTimeline(" ".join([emp1_name]).strip(), e1_start, e1_end, e1_l1, e1_l2, work_date)
-e2 = EmployeeTimeline(" ".join([emp2_name]).strip(), e2_start, e2_end, e2_l1, e2_l2, work_date)
+e1 = EmployeeTimeline(emp1_name, e1_start, e1_end, e1_l1, e1_l2, work_date)
+e2 = EmployeeTimeline(emp2_name, e2_start, e2_end, e2_l1, e2_l2, work_date)
 
 plan_df, un_df = greedy_assign(
     jobs_df, [e1, e2],
@@ -468,12 +533,20 @@ if not un_df.empty:
     st.warning("No se pudieron asignar algunos trabajos:")
     st.dataframe(un_df, use_container_width=True)
 
-st.subheader("📊 Visualización")
-plot_gantt(plan_df)
+st.subheader("📊 Visualización del plan (por empleada)")
+plot_gantt(plan_df, title="Plan de Limpiezas (Gantt)", y_label="Empleadas")
 
 st.subheader("📲 Resumen para WhatsApp")
-wa = whatsapp_summary(plan_df)
-st.code(wa)
+if plan_df.empty:
+    st.code("(Sin asignaciones)")
+else:
+    lines = ["*Plan de Limpiezas* 🧼"]
+    for emp in plan_df["employee"].unique():
+        lines.append(f"\n*{emp}*")
+        sub = plan_df[plan_df["employee"] == emp]
+        for _, r in sub.sort_values("start").iterrows():
+            lines.append(f"• {r['apartment']} — {r['start'].strftime('%H:%M')}–{r['end'].strftime('%H:%M')} ({int(r['duration_min'])}m)")
+    st.code("\n".join(lines))
 
 # Descargar plan asignado
 plan_csv = plan_df.to_csv(index=False).encode("utf-8")
