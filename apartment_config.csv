@@ -1,8 +1,9 @@
 apartment;beds;bath;has_sofabed;base_minutes;linen_change
-Catedral;1;1.5;1;90;1
-Jeronimo;1;1.5;1;90;1
-202;1;1;1;90;1
-204;3;2;1;120;1
-304;3;2;1;120;1
-104;3;2;1;120;1
+Catedral  Casco Viejo;1;1.5;1;90;1
+Jeronimo Casco Viejo;1;1.5;1;90;1
+Jeronimo á Central and Cozy - Apto 4guest!;1;1.5;1;90;1
+Bolivar 202 Casco Viejo;1;1;1;90;1
+Bolivar 204 Casco Viejo;3;2;1;120;1
+Bolivar 304 Casco Viejo;3;2;1;120;1
+Bolivar 104;3;2;1;120;1
 La Cuadra 2D;1;1;1;90;1
