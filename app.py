@@ -141,6 +141,24 @@ def _day_bounds(day, start_t: time, end_t: time):
     d = pd.Timestamp(day).date()
     return TZ.localize(datetime.combine(d, start_t)), TZ.localize(datetime.combine(d, end_t))
 
+def _canon_apt(x):
+    """Limpia nombre, elimina vacíos y unifica alias (Jeronimo...)."""
+    if pd.isna(x):
+        return np.nan
+    s = re.sub(r"\s+", " ", str(x)).strip()
+    if s == "" or s.lower() in {"nan", "none", "-"}:
+        return np.nan
+    norm = _norm(s)
+    alias = {
+        # variantes comunes del mismo Jerónimo
+        "jeronimocascoviejo": "Jeronimo Casco Viejo",
+        "jeronimocentralandcozyapto": "Jeronimo Casco Viejo",
+        "jeronimocentralandcozyapt": "Jeronimo Casco Viejo",
+        "jeronimocentralcozyapto": "Jeronimo Casco Viejo",
+        "jeronimocentralandcozy": "Jeronimo Casco Viejo",
+    }
+    return alias.get(norm, s)
+
 # ==============================
 # NORMALIZACIÓN
 # ==============================
@@ -169,8 +187,10 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     apt_col   = _find_col(df, ["Property Internal Name"])
     guest_col = _find_col(df, ["Guest First Name"])
-    if apt_col:   out["apartment"]  = df[apt_col].astype(str)
-    if guest_col: out["guest_name"] = df[guest_col].astype(str)
+    if apt_col:
+        out["apartment"]  = df[apt_col].apply(_canon_apt)  # <- normaliza apto (quita nan, unifica Jeronimo)
+    if guest_col:
+        out["guest_name"] = df[guest_col].astype(str)
 
     map_optional = {
         "number_guests": ["NUMBER GUESTS","Guests","# Guests","Numero Huespedes","Nº Huespedes"],
@@ -274,6 +294,7 @@ def _events_por_apartamento(normalized: pd.DataFrame, day, day_start_t: time, da
     """
     start_of_day, end_of_day = _day_bounds(day, day_start_t, day_end_t)
     df = normalized.copy()
+    df["apartment"] = df["apartment"]  # ya viene canónico
     df["checkin"]  = to_tz(df["checkin"])
     df["checkout"] = to_tz(df["checkout"])
 
@@ -328,9 +349,18 @@ def day_summary_collapsed_v2(normalized: pd.DataFrame, day, day_start_t: time, d
             rows.append({"apartment": apt, "tipo": "Solo Check-In", "checkout_time": "", "checkin_time": _fmt(cis), "gap_hours": ""})
         elif kind == "vacio":
             rows.append({"apartment": apt, "tipo": "Vacío (día completo)", "checkout_time": "", "checkin_time": "", "gap_hours": 24})
-    if not rows:
+
+    df = pd.DataFrame(rows)
+    if df.empty:
         return pd.DataFrame(columns=["apartment","tipo","checkout_time","checkin_time","gap_hours"])
-    return pd.DataFrame(rows).sort_values(["tipo","apartment"]).reset_index(drop=True)
+
+    # quitar nulos por si acaso
+    df = df[df["apartment"].notna()].copy()
+
+    # BALI siempre al final
+    df["__bali__"] = df["apartment"].astype(str).eq("BALI")
+    df = df.sort_values(["__bali__", "tipo", "apartment"], ascending=[True, True, True]).drop(columns="__bali__")
+    return df.reset_index(drop=True)
 
 def build_apartment_windows_v2(normalized: pd.DataFrame, day, day_start_t: time, day_end_t: time, extra_apts=None) -> pd.DataFrame:
     ev = _events_por_apartamento(normalized, day, day_start_t, day_end_t, extra_apts)
@@ -341,9 +371,13 @@ def build_apartment_windows_v2(normalized: pd.DataFrame, day, day_start_t: time,
         ini, fin, kind = v
         if fin > ini:
             rows.append({"apartment": apt, "start": ini, "end": fin, "kind": kind})
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    if out.empty: return out
+    out["__bali__"] = out["apartment"].astype(str).eq("BALI")   # BALI al final también en el Gantt
+    out = out.sort_values(["__bali__", "apartment"]).drop(columns="__bali__").reset_index(drop=True)
+    return out
 
-# ============ Scheduler automático (por si lo sigues usando) ============
+# ============ Scheduler automático (opcional) ============
 class EmployeeTimeline:
     def __init__(self, name, start_t: time, end_t: time, lunch_start: time, lunch_end: time, day):
         self.name = name; self.day = pd.Timestamp(day).date()
@@ -553,7 +587,7 @@ with tab1:
 
     # ---- editor de asignaciones manuales ----
     st.markdown("**Asigna quién y a qué hora limpiar (manual)**")
-    # Construimos una tabla base con ventanas detectadas por apto
+    # Ventanas por apto
     win_df = build_apartment_windows_v2(normalized, work_date, day_start_t, day_end_t, extra_apts)
     win_map = {r["apartment"]: r for _, r in win_df.iterrows()}
     def _fmt(t): return t.tz_convert(TZ_NAME).strftime("%H:%M")
@@ -647,9 +681,8 @@ with tab1:
         ax.set_xlabel("Horas del día"); ax.set_title("Ventanas libres para limpieza")
         st.pyplot(fig)
 
-    # ======= (Opcional) Plan automático — lo dejo dentro de un expander =======
+    # ======= (Opcional) Plan automático — dentro de un expander =======
     with st.expander("⚙️ Plan automático (opcional)"):
-        # A lo sumo UNA tarea por apartamento:
         def build_cleaning_jobs_v2(normalized: pd.DataFrame, day, default_duration: int, mop_minutes: int,
                                    day_start_t: time, day_end_t: time, extra_apts=None) -> pd.DataFrame:
             ev = _events_por_apartamento(normalized, day, day_start_t, day_end_t, extra_apts)
