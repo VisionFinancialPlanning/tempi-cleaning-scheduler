@@ -67,42 +67,38 @@ def _combine(date_s, time_s, default_time: time):
         return ser
     return ser
 
+# ==============================
+# NORMALIZACIÓN DE RESERVAS (tus columnas exactas)
+# ==============================
 def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Usa nombres EXACTOS para fechas/horas:
+    Usa nombres EXACTOS:
       - Check-In (fecha)
       - Check-In Hora (hora) [opcional]
       - Check-Out (fecha)
       - Check-Out Hora (hora) [opcional]
-
-    Además:
-      - 'Property Internal Name' -> apartment
-      - 'Guest First Name' -> guest_name
-
-    Si faltan horas, aplica CI=15:00 / CO=12:00.
+      - Property Internal Name -> apartment
+      - Guest First Name -> guest_name
+    Si faltan horas, aplica CI=15:00 / CO=12:00 (y marca el origen).
     """
     missing_dates = [c for c in ["Check-In", "Check-Out"] if c not in df.columns]
     if missing_dates:
-        raise ValueError(
-            "Faltan columnas obligatorias: "
-            + ", ".join(missing_dates)
-            + ". Debe incluir al menos 'Check-In' y 'Check-Out'."
-        )
+        raise ValueError("Faltan columnas obligatorias: " + ", ".join(missing_dates))
 
-    ci_dt = _combine(
-        df["Check-In"],
-        df["Check-In Hora"] if "Check-In Hora" in df.columns else None,
-        default_time=time(15, 0),
-    )
-    co_dt = _combine(
-        df["Check-Out"],
-        df["Check-Out Hora"] if "Check-Out Hora" in df.columns else None,
-        default_time=time(12, 0),
-    )
+    has_ci_time = "Check-In Hora" in df.columns
+    has_co_time = "Check-Out Hora" in df.columns
+
+    ci_time_parsed = _coerce_time(df["Check-In Hora"]) if has_ci_time else pd.Series([None]*len(df))
+    co_time_parsed = _coerce_time(df["Check-Out Hora"]) if has_co_time else pd.Series([None]*len(df))
+    ci_used_default = ci_time_parsed.isna()
+    co_used_default = co_time_parsed.isna()
+
+    ci_dt = _combine(df["Check-In"], df["Check-In Hora"] if has_ci_time else None, default_time=time(15, 0))
+    co_dt = _combine(df["Check-Out"], df["Check-Out Hora"] if has_co_time else None, default_time=time(12, 0))
 
     out = pd.DataFrame()
 
-    # Mapear columnas de interés a nombres estándar
+    # Mapeo apartment / guest
     if "Property Internal Name" in df.columns:
         out["apartment"] = df["Property Internal Name"].astype(str)
     elif "apartment" in df.columns:
@@ -113,15 +109,10 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     elif "guest_name" in df.columns:
         out["guest_name"] = df["guest_name"].astype(str)
 
-    # Campos adicionales si existen
-    for optional in ["unit_id", "Apartamento", "Unidad", "Huésped"]:
-        if optional in df.columns and optional not in out.columns:
-            out[optional] = df[optional]
-
     out["checkin"] = ci_dt
     out["checkout"] = co_dt
 
-    # Derivadas para mostrar/descargar (robustas si falta tz)
+    # Derivadas (robustas si falta tz)
     def _tz_fmt(series, fmt):
         try:
             return series.dt.tz_convert(TZ_NAME).dt.strftime(fmt)
@@ -138,28 +129,26 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # Noches
     try:
-        nights = (
-            out["checkout"].dt.tz_convert(TZ_NAME).dt.date
-            - out["checkin"].dt.tz_convert(TZ_NAME).dt.date
-        )
+        nights = out["checkout"].dt.tz_convert(TZ_NAME).dt.date - out["checkin"].dt.tz_convert(TZ_NAME).dt.date
     except Exception:
-        nights = (
-            pd.to_datetime(out["checkout"], errors="coerce").dt.date
-            - pd.to_datetime(out["checkin"], errors="coerce").dt.date
-        )
+        nights = pd.to_datetime(out["checkout"], errors="coerce").dt.date - pd.to_datetime(out["checkin"], errors="coerce").dt.date
     out["nights"] = [d.days if pd.notna(d) else None for d in nights]
 
+    # Indicadores de origen de hora
+    out["checkin_time_source"] = np.where(ci_used_default, "default 15:00", "archivo")
+    out["checkout_time_source"] = np.where(co_used_default, "default 12:00", "archivo")
+
     preferred = [
-        "apartment", "unit_id", "guest_name",
-        "checkin_day", "checkin_time",
-        "checkout_day", "checkout_time",
+        "apartment", "guest_name",
+        "checkin_day", "checkin_time", "checkin_time_source",
+        "checkout_day", "checkout_time", "checkout_time_source",
         "nights", "checkin", "checkout",
     ]
     cols = [c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]
     return out[cols]
 
 # ==============================
-# SCHEDULER (lógica integrada)
+# SCHEDULER
 # ==============================
 @st.cache_data
 def load_apartment_config():
@@ -200,28 +189,47 @@ def infer_duration(row, default_duration, cfg):
     if "clean_duration_minutes" in row and pd.notna(row["clean_duration_minutes"]):
         return int(row["clean_duration_minutes"])
     if cfg is not None and not cfg.empty and "apartment" in cfg.columns:
-        apt_name = str(row.get("apartment", row.get("Apartamento", ""))).strip().lower()
+        apt_name = str(row.get("apartment", "")).strip().lower()
         hit = cfg[cfg["apartment"].astype(str).str.lower() == apt_name]
         if not hit.empty:
             return int(hit.iloc[0].get("base_minutes", default_duration))
     return default_duration
 
-def build_cleaning_jobs(day_df: pd.DataFrame, day, default_duration: int, cfg: pd.DataFrame) -> pd.DataFrame:
+def build_cleaning_jobs(day_df: pd.DataFrame, day, default_duration: int, cfg: pd.DataFrame, mop_minutes: int) -> pd.DataFrame:
+    """
+    Reglas:
+      - Turnover (checkout & checkin hoy) -> limpieza completa (deadline = checkin)
+      - Solo checkout hoy -> limpieza completa
+      - Solo checkin hoy -> mopa rápida (mop_minutes), deadline = checkin
+    """
     jobs = []
+    the_day = pd.Timestamp(day).date()
+
     for _, row in day_df.iterrows():
-        apt = row.get("apartment", row.get("Apartamento", "Apto"))
-        unit = row.get("unit_id", row.get("Unidad", ""))
-        guest = row.get("guest_name", row.get("Huésped", ""))
+        apt = row.get("apartment", "Apto")
+        unit = row.get("unit_id", "")
+        guest = row.get("guest_name", "")
 
         checkout = row.get("checkout", pd.NaT)
         checkin = row.get("checkin", pd.NaT)
 
-        duration = infer_duration(row, default_duration, cfg)
+        is_checkout_today = pd.notna(checkout) and checkout.date() == the_day
+        is_checkin_today = pd.notna(checkin) and checkin.date() == the_day
 
-        # ventana mínima: desde checkout (si existe) o 08:00
-        start_window = checkout if pd.notna(checkout) else TZ.localize(datetime.combine(pd.Timestamp(day).date(), time(8, 0)))
-        # deadline: checkin del mismo día si existe
-        deadline = checkin if (pd.notna(checkin) and checkin.date() == pd.Timestamp(day).date()) else pd.NaT
+        if is_checkout_today and is_checkin_today:
+            duration = infer_duration(row, default_duration, cfg)
+            start_window = checkout
+            deadline = checkin
+        elif is_checkout_today:
+            duration = infer_duration(row, default_duration, cfg)
+            start_window = checkout
+            deadline = pd.NaT
+        elif is_checkin_today:
+            duration = int(mop_minutes)
+            start_window = TZ.localize(datetime.combine(the_day, time(8, 0)))
+            deadline = checkin
+        else:
+            continue
 
         jobs.append({
             "apartment": apt,
@@ -278,7 +286,6 @@ def greedy_assign(jobs_df, employees, buffer_min=10, travel_min=0, early_priorit
         return pd.DataFrame(columns=["employee","apartment","unit_id","guest_name","start","end","duration_min"]), pd.DataFrame()
 
     sort_keys = jobs_df.copy()
-    # Rellenar deadlines vacíos con muy tarde
     min_day = sort_keys["start_window"].dt.date.min()
     far = TZ.localize(datetime.combine(min_day, time(23, 59)))
     sort_keys["deadline_filled"] = sort_keys["deadline"].fillna(far)
@@ -298,7 +305,6 @@ def greedy_assign(jobs_df, employees, buffer_min=10, travel_min=0, early_priorit
         if not candidates:
             unassigned.append(job.to_dict())
             continue
-        # elegir quien termina más temprano
         emp_sel, slot = sorted(candidates, key=lambda x: x[1]["end"])[0]
         emp_sel.schedule(job, buffer_min=buffer_min, travel_min=travel_min)
         assignments.append(slot)
@@ -361,14 +367,14 @@ with st.sidebar:
     e2_start, e2_end = shift_block("Empleado 2", time(8,0), time(17,0))
 
     st.subheader("Almuerzo (movible)")
-    # Por defecto 11:00–12:00 m.d., pero el usuario puede moverlo
     e1_l1, e1_l2 = shift_block("Empleado 1 – Almuerzo", time(11,0), time(12,0))
     e2_l1, e2_l2 = shift_block("Empleado 2 – Almuerzo", time(11,0), time(12,0))
 
     st.subheader("Parámetros del Plan")
     buffer_minutes = st.number_input("Buffer entre limpiezas (min)", value=10, step=5)
     travel_minutes = st.number_input("Traslado entre apartamentos (min)", value=0, step=5)
-    default_duration = st.number_input("Duración por defecto (min)", value=90, step=5)
+    default_duration = st.number_input("Duración limpieza completa (min)", value=90, step=5)
+    mop_minutes = st.number_input("Duración mopa (solo check-in) (min)", value=20, step=5)
     early_priority = st.checkbox("Priorizar salidas tempranas (deadline primero)", value=True)
     use_apt_cfg = st.checkbox("Usar apartment_config.csv (tiempos por apto)", value=True)
 
@@ -376,14 +382,13 @@ with st.sidebar:
 # CARGA → NORMALIZA → SCHEDULER (UN SOLO FLUJO)
 # ==============================
 uploaded = st.file_uploader(
-    "Sube tu Excel de reservas (.xlsx). Requeridas: 'Check-In', 'Check-Out'. Opcionales: 'Check-In Hora', 'Check-Out Hora', 'Property Internal Name', 'Guest First Name'",
+    "Sube tu Excel (.xlsx) con: 'Check-In', 'Check-Out' (obligatorias) y opcionales 'Check-In Hora', 'Check-Out Hora', 'Property Internal Name', 'Guest First Name'",
     type=["xlsx"]
 )
 
 if uploaded is not None:
     df_raw = pd.read_excel(uploaded)
 else:
-    # Fallback a archivo de ejemplo
     try:
         st.info("Usando datos de ejemplo: sample_bookings.xlsx")
         df_raw = pd.read_excel("sample_bookings.xlsx")
@@ -394,12 +399,22 @@ else:
 st.subheader("📄 Reservas – Original (preview)")
 st.dataframe(df_raw.head(10), use_container_width=True)
 
-# Normalizar (con tus columnas exactas + mapeo apartment/guest_name)
+# Normalizar
 try:
     normalized = parse_bookings_with_fixed_columns(df_raw)
 except Exception as e:
     st.error(f"Error al normalizar reservas: {e}")
     st.stop()
+
+# Aviso si muchas horas vienen por default
+if "checkin_time_source" in normalized.columns and "checkout_time_source" in normalized.columns:
+    pct_ci_def = (normalized["checkin_time_source"] == "default 15:00").mean() * 100
+    pct_co_def = (normalized["checkout_time_source"] == "default 12:00").mean() * 100
+    if pct_ci_def > 50 or pct_co_def > 50:
+        st.warning(
+            f"Muchas horas vienen por defecto (Check-In {pct_ci_def:.0f}%, Check-Out {pct_co_def:.0f}%). "
+            "Revisa que 'Check-In Hora' y 'Check-Out Hora' tengan valores en el Excel."
+        )
 
 st.success("✅ Reservas normalizadas")
 st.dataframe(normalized, use_container_width=True)
@@ -430,14 +445,14 @@ day_df = filter_day(normalized, work_date)
 st.subheader("📄 Reservas del día (normalizadas)")
 st.dataframe(day_df, use_container_width=True)
 
-# Generar trabajos
-jobs_df = build_cleaning_jobs(day_df, work_date, default_duration, apt_cfg)
+# Generar trabajos con tus reglas
+jobs_df = build_cleaning_jobs(day_df, work_date, default_duration, apt_cfg, mop_minutes)
 st.subheader("🧱 Trabajos a programar")
 st.dataframe(jobs_df, use_container_width=True)
 
 # Timelines / Empleadas
-e1 = EmployeeTimeline(emp1_name, e1_start, e1_end, e1_l1, e1_l2, work_date)
-e2 = EmployeeTimeline(emp2_name, e2_start, e2_end, e2_l1, e2_l2, work_date)
+e1 = EmployeeTimeline(" ".join([emp1_name]).strip(), e1_start, e1_end, e1_l1, e1_l2, work_date)
+e2 = EmployeeTimeline(" ".join([emp2_name]).strip(), e2_start, e2_end, e2_l1, e2_l2, work_date)
 
 plan_df, un_df = greedy_assign(
     jobs_df, [e1, e2],
