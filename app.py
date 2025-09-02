@@ -2,7 +2,7 @@
 import os
 os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
 
-import re, unicodedata
+import re, unicodedata, hashlib
 import urllib.parse as _q
 from datetime import datetime, time, timedelta
 
@@ -24,6 +24,65 @@ TZ = pytz.timezone(TZ_NAME)
 st.set_page_config(page_title="Tempi – Scheduler & Bookings", page_icon="🧹", layout="wide")
 st.title("Tempi – Scheduler & Bookings 🧹📒")
 st.caption(f"Zona horaria aplicada: {TZ_NAME}")
+
+# ==============================
+# 🔒 PASSWORD GATE
+# ==============================
+def _get_secret(key, default=""):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+SECRET_PLAIN = os.environ.get("TEMPI_PASSWORD") or _get_secret("APP_PASSWORD", "")
+SECRET_SHA   = os.environ.get("TEMPI_PASSWORD_SHA256") or _get_secret("APP_PASSWORD_SHA256", "")
+
+def _check_plain(pwd: str) -> bool:
+    return bool(SECRET_PLAIN) and (pwd == SECRET_PLAIN)
+
+def _check_hash(pwd: str) -> bool:
+    if not SECRET_SHA:
+        return False
+    try:
+        return hashlib.sha256(pwd.encode("utf-8")).hexdigest() == SECRET_SHA.lower()
+    except Exception:
+        return False
+
+def check_password():
+    # Si no hay contraseña configurada, dejar pasar pero avisar.
+    if not SECRET_PLAIN and not SECRET_SHA:
+        with st.sidebar:
+            st.info("🔓 Esta app no tiene contraseña configurada.\n\nConfigura `APP_PASSWORD` o `APP_PASSWORD_SHA256` en *Secrets* para activarla.")
+        return True
+
+    if "pass_ok" in st.session_state and st.session_state.pass_ok:
+        with st.sidebar:
+            if st.button("Cerrar sesión"):
+                st.session_state.pass_ok = False
+                st.experimental_rerun()
+        return True
+
+    with st.sidebar:
+        st.subheader("🔒 Acceso")
+        pwd = st.text_input("Contraseña", type="password")
+        col_a, col_b = st.columns([1,1])
+        with col_a:
+            login = st.button("Entrar")
+        with col_b:
+            reset = st.button("Limpiar")
+        if reset:
+            st.experimental_rerun()
+        if login:
+            if _check_plain(pwd) or _check_hash(pwd):
+                st.session_state.pass_ok = True
+                st.experimental_rerun()
+            else:
+                st.error("Contraseña incorrecta.")
+                st.stop()
+        else:
+            st.stop()
+
+check_password()
 
 # ==============================
 # HELPERS
@@ -470,6 +529,7 @@ with st.sidebar:
     st.subheader("WhatsApp (opcional)")
     wa_emp1 = st.text_input("WhatsApp Empleado 1 (solo dígitos)", value="")
     wa_emp2 = st.text_input("WhatsApp Empleado 2 (solo dígitos)", value="")
+    wa_concierge = st.text_input("WhatsApp Conserje (solo dígitos)", value="")
 
 # ==============================
 # CARGA ARCHIVO
@@ -515,7 +575,11 @@ with tab1:
         st.dataframe(prep_df[cols_show], use_container_width=True)
 
     st.subheader("💵 Recolección de CASH (en checkout de hoy)")
-    cash_pickups = normalized[(normalized.get("cash_pickup", False) == True) & (normalized["checkout_day"] == today_str)]  # noqa: E712
+    if "cash_pickup" in normalized.columns:
+        mask_cash = normalized["cash_pickup"].eq(True) & normalized["checkout_day"].eq(today_str)
+    else:
+        mask_cash = pd.Series([False]*len(normalized))
+    cash_pickups = normalized[mask_cash]
     if cash_pickups.empty:
         st.success("No hay recolecciones de CASH para hoy.")
     else:
@@ -583,6 +647,35 @@ with tab1:
     extra_apts = ["BALI"]  # apartamento extra fijo
     summary_df = day_summary_collapsed_v2(normalized, work_date, day_start_t, day_end_t, extra_apts)
     st.dataframe(summary_df, use_container_width=True)
+
+    # 🧑‍🏫 Resumen para Conserje — Solo Check-In (hoy)
+    st.subheader("🧑‍🏫 Resumen para Conserje — Solo Check-In (hoy)")
+    solo_ci_apts = summary_df.loc[summary_df["tipo"].eq("Solo Check-In"), "apartment"].astype(str).tolist()
+    conc_df = normalized[
+        (normalized["checkin_day"] == today_str) &
+        (normalized["apartment"].astype(str).isin(solo_ci_apts))
+    ].copy()
+    keep_cols = [c for c in ["apartment", "guest_name", "checkin_time"] if c in conc_df.columns]
+    conc_view = conc_df[keep_cols].sort_values(["checkin_time","apartment"]) if not conc_df.empty else conc_df
+    if conc_view.empty:
+        st.info("No hay apartamentos 'Solo Check-In' para hoy.")
+    else:
+        st.dataframe(conc_view, use_container_width=True)
+        fecha_str = pd.Timestamp(work_date).strftime("%d/%m/%Y")
+        lines = [f"Entradas (Solo Check-In) – {fecha_str}:"]
+        for _, r in conc_view.iterrows():
+            hora = str(r.get("checkin_time","")).strip()
+            apt  = str(r.get("apartment","")).strip()
+            g    = str(r.get("guest_name","")).strip()
+            lines.append(f"• {hora} – {apt} – {g}")
+        concierge_msg = "\n".join(lines) + "\n\nGracias."
+        st.text_area("Mensaje para Conserje", concierge_msg, height=140)
+        phone_digits = re.sub(r"\D", "", wa_concierge or "")
+        if phone_digits:
+            wa_link = f"https://wa.me/{phone_digits}?text={_q.quote(concierge_msg)}"
+            st.markdown(f"[Enviar por WhatsApp al **Conserje**]({wa_link})")
+        csv_bytes = conc_view.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Descargar CSV para Conserje", data=csv_bytes, file_name=f"solo_checkin_{today_str}.csv", mime="text/csv")
 
     st.markdown("**Asigna quién y a qué hora limpiar (manual)**")
     # Ventanas por apto (para referencia)
