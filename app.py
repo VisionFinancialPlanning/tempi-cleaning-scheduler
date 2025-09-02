@@ -273,7 +273,8 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
         "channel":       ["Channel","Source","Booking Source","OTA","Origin","Website","Portal","Booked Via"],
         "payment_method":["Payment Method","Payment","Método de Pago","Forma de pago","Payment Type","Pay Method"],
         "amount_due":    ["Amount Due","Balance Due","Balance","Total Due","Pending Amount","Por cobrar","A Cobrar","Saldo","Saldo pendiente","Total Pendiente"],
-        "total_price":   ["Total Price","Total","Precio Total","Importe","Booking Amount","Payment Amount","Grand Total","Monto","Monto Total"]
+        "total_price":   ["Total Price","Total","Precio Total","Importe","Booking Amount","Payment Amount","Grand Total","Monto","Monto Total"],
+        "phone":         ["Phone","Guest Phone","Phone Number","Mobile","Celular","Teléfono","Telefono","Contact","Contact Phone","Guest Mobile"],
     }
     for new_col, aliases in map_optional.items():
         c = _find_col(df, aliases)
@@ -326,7 +327,7 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     preferred = [
         "apartment","guest_name","number_guests","sofa_or_bed","reservation_id",
-        "transporte","extra","parking","nombre","notes",
+        "transporte","extra","parking","nombre","notes","phone",
         "channel","payment_method","amount_due","total_price",
         "cash_pickup","cash_amount","cash_reason",
         "checkin_day","checkin_time","checkin_time_source",
@@ -523,6 +524,7 @@ with st.sidebar:
     wa_emp1 = st.text_input("WhatsApp Empleado 1 (solo dígitos)", value="")
     wa_emp2 = st.text_input("WhatsApp Empleado 2 (solo dígitos)", value="")
     wa_concierge = st.text_input("WhatsApp Conserje (solo dígitos)", value="")
+    wa_driver = st.text_input("WhatsApp Motorista (solo dígitos)", value="")
 
 # ==============================
 # CARGA ARCHIVO
@@ -561,7 +563,7 @@ with tab1:
     else:
         cols_show = [c for c in [
             "apartment","guest_name","number_guests","sofa_or_bed","reservation_id",
-            "transporte","extra","parking","nombre","notes",
+            "transporte","extra","parking","nombre","notes","phone",
             "channel","payment_method","amount_due","total_price",
             "checkin_day","checkin_time","checkout_day","checkout_time"
         ] if c in prep_df.columns]
@@ -621,19 +623,117 @@ with tab1:
     else:
         st.info("No se encontraron columnas ‘TRANSPORTE CHECK-IN’ / ‘TRANSPORTE CHECK-OUT’ en el archivo.")
 
-    # 🅿️ Parking (cantidad de carros)
-    st.subheader("🅿️ Parking – Check-ins de hoy")
-    park_df = prep_df[prep_df["checkin_day"] == today_str].copy()
-    if "parking" in park_df.columns and not park_df.empty:
-        park_df["carros"] = park_df["parking"].apply(_parse_parking_count)
-        park_out = park_df[["apartment","guest_name","checkin_time","carros","parking"]].rename(columns={"parking":"detalle"})
-        park_out = park_out[park_out["carros"].notna()]
-        if park_out.empty:
-            st.info("No hay solicitudes de parking para hoy.")
-        else:
-            st.dataframe(park_out.sort_values(["checkin_time","apartment"]), use_container_width=True)
+    # 🚐📋 Resumen para Motorista — Transportes de hoy
+    st.subheader("🚐📋 Resumen para Motorista — Transportes de hoy")
+
+    def _pick_name(row):
+        g = str(row.get("guest_name","")).strip()
+        if g: return g
+        return str(row.get("nombre","")).strip()
+
+    def _clean_phone(val: str) -> str:
+        s = re.sub(r"\D", "", str(val or ""))
+        if len(s) == 8:  # Panamá sin +507
+            s = "507" + s
+        if s.startswith("00"):  # 00 -> internacional
+            s = s[2:]
+        return s
+
+    def _build_driver_block(df_in, kind):
+        """kind: 'CHECK-IN' o 'CHECK-OUT'."""
+        if df_in.empty:
+            return pd.DataFrame(), []
+        out_rows = []
+        lines = []
+        for _, r in df_in.sort_values(["Hora","Apartamento"]).iterrows():
+            out_rows.append({
+                "Acción": kind,
+                "Fecha": r.get("Fecha",""),
+                "Hora": r.get("Hora",""),
+                "Apartamento": r.get("Apartamento",""),
+                "Nombre": r.get("Nombre",""),
+                "Teléfono": r.get("Teléfono",""),
+                "Notas": r.get("Notas",""),
+            })
+            lines.append(f"• {r.get('Hora','')} {kind} – {r.get('Apartamento','')} – {r.get('Nombre','')} – {r.get('Teléfono','')} – {r.get('Fecha','')} | {r.get('Notas','')}")
+        return pd.DataFrame(out_rows), lines
+
+    base_mov = normalized[(normalized["checkin_day"] == today_str) | (normalized["checkout_day"] == today_str)].copy()
+
+    # Filtros SI transporte
+    if "transport_ci" in base_mov.columns:
+        t_ci = base_mov[(base_mov["checkin_day"] == today_str) & (base_mov["transport_ci"].apply(_is_si))].copy()
     else:
-        st.info("No hay datos de parking para hoy.")
+        t_ci = pd.DataFrame(columns=base_mov.columns)
+    if "transport_co" in base_mov.columns:
+        t_co = base_mov[(base_mov["checkout_day"] == today_str) & (base_mov["transport_co"].apply(_is_si))].copy()
+    else:
+        t_co = pd.DataFrame(columns=base_mov.columns)
+
+    def _hora_ci(r): return _hora_from_cols(r, "ci")
+    def _hora_co(r): return _hora_from_cols(r, "co")
+
+    # Armar vistas CI
+    if not t_ci.empty:
+        t_ci["hora"] = t_ci.apply(_hora_ci, axis=1)
+        t_ci["fecha"] = t_ci["checkin_day"]
+        t_ci["Nombre"] = t_ci.apply(_pick_name, axis=1)
+        t_ci["Teléfono"] = t_ci.get("phone", pd.Series([""]*len(t_ci))).apply(_clean_phone)
+        t_ci["Notas"] = t_ci.get("notes","").astype(str).fillna("") \
+                        + np.where(t_ci["hora"].astype(str).str.strip() != "", " | Check-In " + t_ci["hora"].astype(str), "")
+        t_ci_view = t_ci[["apartment","Nombre","Teléfono","fecha","hora","Notas"]].rename(
+            columns={"apartment":"Apartamento","fecha":"Fecha","hora":"Hora"}
+        )
+    else:
+        t_ci_view = pd.DataFrame(columns=["Apartamento","Nombre","Teléfono","Fecha","Hora","Notas"])
+
+    # Armar vistas CO
+    if not t_co.empty:
+        t_co["hora"] = t_co.apply(_hora_co, axis=1)
+        t_co["fecha"] = t_co["checkout_day"]
+        t_co["Nombre"] = t_co.apply(_pick_name, axis=1)
+        t_co["Teléfono"] = t_co.get("phone", pd.Series([""]*len(t_co))).apply(_clean_phone)
+        t_co["Notas"] = t_co.get("notes","").astype(str).fillna("") \
+                        + np.where(t_co["hora"].astype(str).str.strip() != "", " | Check-Out " + t_co["hora"].astype(str), "")
+        t_co_view = t_co[["apartment","Nombre","Teléfono","fecha","hora","Notas"]].rename(
+            columns={"apartment":"Apartamento","fecha":"Fecha","hora":"Hora"}
+        )
+    else:
+        t_co_view = pd.DataFrame(columns=["Apartamento","Nombre","Teléfono","Fecha","Hora","Notas"])
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("**Transportes CHECK-IN (hoy)**")
+        st.dataframe(t_ci_view.sort_values(["Hora","Apartamento"]) if not t_ci_view.empty else t_ci_view,
+                     use_container_width=True)
+    with colB:
+        st.markdown("**Transportes CHECK-OUT (hoy)**")
+        st.dataframe(t_co_view.sort_values(["Hora","Apartamento"]) if not t_co_view.empty else t_co_view,
+                     use_container_width=True)
+
+    # Mensaje WhatsApp para motorista
+    fecha_str = pd.Timestamp(work_date).strftime("%d/%m/%Y")
+    msg_lines = [f"Traslados de hoy – {fecha_str}"]
+    df_ci_msg, ci_lines = _build_driver_block(t_ci_view, "CHECK-IN")
+    df_co_msg, co_lines = _build_driver_block(t_co_view, "CHECK-OUT")
+    if ci_lines:
+        msg_lines.append("\nCHECK-IN:")
+        msg_lines += ci_lines
+    if co_lines:
+        msg_lines.append("\nCHECK-OUT:")
+        msg_lines += co_lines
+    driver_msg = "\n".join(msg_lines) if (ci_lines or co_lines) else "Sin traslados para hoy."
+    st.text_area("Mensaje para Motorista", driver_msg, height=220)
+
+    driver_phone = re.sub(r"\D", "", wa_driver or "")
+    if driver_phone:
+        wa_link_driver = f"https://wa.me/{driver_phone}?text={_q.quote(driver_msg)}"
+        st.markdown(f"[Enviar por WhatsApp al **Motorista**]({wa_link_driver})")
+
+    driver_csv = pd.concat([t_ci_view.assign(Acción="CHECK-IN"), t_co_view.assign(Acción="CHECK-OUT")], ignore_index=True)
+    driver_csv = driver_csv[["Acción","Fecha","Hora","Apartamento","Nombre","Teléfono","Notas"]] if not driver_csv.empty else driver_csv
+    st.download_button("⬇️ Descargar CSV para Motorista", data=driver_csv.to_csv(index=False).encode("utf-8"),
+                       file_name=f"transportes_motorista_{today_str}.csv", mime="text/csv")
 
     # ========================= Resumen + ASIGNACIÓN MANUAL =========================
     st.subheader("🧾 Resumen por apartamento (día) + asignación manual")
@@ -655,7 +755,6 @@ with tab1:
         st.info("No hay check-ins para hoy.")
     else:
         st.dataframe(conc_view, use_container_width=True)
-        fecha_str = pd.Timestamp(work_date).strftime("%d/%m/%Y")
         lines = [f"Entradas de hoy – {fecha_str}:"]
         for _, r in conc_view.iterrows():
             hora = str(r.get("checkin_time","")).strip()
