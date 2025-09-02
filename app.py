@@ -49,13 +49,12 @@ def _check_hash(pwd: str) -> bool:
         return False
 
 def check_password():
-    # Si no hay contraseña configurada, dejar pasar pero avisar.
     if not SECRET_PLAIN and not SECRET_SHA:
         with st.sidebar:
             st.info("🔓 Esta app no tiene contraseña configurada.\n\nConfigura `APP_PASSWORD` o `APP_PASSWORD_SHA256` en *Secrets* para activarla.")
         return True
 
-    if "pass_ok" in st.session_state and st.session_state.pass_ok:
+    if st.session_state.get("pass_ok"):
         with st.sidebar:
             if st.button("Cerrar sesión"):
                 st.session_state.pass_ok = False
@@ -65,11 +64,9 @@ def check_password():
     with st.sidebar:
         st.subheader("🔒 Acceso")
         pwd = st.text_input("Contraseña", type="password")
-        col_a, col_b = st.columns([1,1])
-        with col_a:
-            login = st.button("Entrar")
-        with col_b:
-            reset = st.button("Limpiar")
+        c1, c2 = st.columns(2)
+        with c1: login = st.button("Entrar")
+        with c2: reset = st.button("Limpiar")
         if reset:
             st.experimental_rerun()
         if login:
@@ -113,7 +110,6 @@ def _coerce_time(series):
         if pd.isna(v): return None
         if isinstance(v, (pd.Timestamp, datetime)): return v.time()
         if isinstance(v, (int, float)):
-            # Excel time serial
             try:
                 frac = float(v) % 1.0
                 secs = int(round(frac * 24 * 3600))
@@ -402,7 +398,7 @@ def day_summary_collapsed_v2(normalized: pd.DataFrame, day, day_start_t: time, d
     if df.empty:
         return pd.DataFrame(columns=["apartment","tipo","checkout_time","checkin_time","gap_hours"])
     df = df[df["apartment"].notna()].copy()
-    df["__bali__"] = df["apartment"].astype(str).eq("BALI")     # BALI al final
+    df["__bali__"] = df["apartment"].astype(str).eq("BALI")
     df = df.sort_values(["__bali__", "tipo", "apartment"], ascending=[True, True, True]).drop(columns="__bali__")
     return df.reset_index(drop=True)
 
@@ -550,7 +546,7 @@ except Exception as e:
 # ==============================
 # TABS
 # ==============================
-tab1, tab2 = st.tabs(["🧭 Operativa del día", "📈 Analítica mensual"])
+tab1, tab2, tab3 = st.tabs(["🧭 Operativa del día", "📈 Analítica mensual", "🚐 Transportes"])
 
 # ====== TAB 1: Operativa del día ======
 with tab1:
@@ -582,159 +578,6 @@ with tab1:
         st.warning("Coordinar recolección en estos apartamentos:")
         st.dataframe(cash_pickups[show_cols], use_container_width=True)
 
-    # 🚐 Agendar Transporte (hoy)
-    st.subheader("🚐 Agendar Transporte (hoy)")
-    trans_df = prep_df.copy()
-    has_ci = "transport_ci" in trans_df.columns
-    has_co = "transport_co" in trans_df.columns
-
-    def _hora_from_cols(row, kind):
-        if kind == "ci":
-            if "checkin_time" in row and pd.notna(row["checkin_time"]) and str(row["checkin_time"]).strip():
-                return row["checkin_time"]
-            if "checkin" in row and pd.notna(row["checkin"]):
-                try: return row["checkin"].tz_convert(TZ_NAME).strftime("%H:%M")
-                except Exception: return pd.to_datetime(row["checkin"]).strftime("%H:%M")
-        else:
-            if "checkout_time" in row and pd.notna(row["checkout_time"]) and str(row["checkout_time"]).strip():
-                return row["checkout_time"]
-            if "checkout" in row and pd.notna(row["checkout"]):
-                try: return row["checkout"].tz_convert(TZ_NAME).strftime("%H:%M")
-                except Exception: return pd.to_datetime(row["checkout"]).strftime("%H:%M")
-        return ""
-
-    if has_ci or has_co:
-        out_rows = []
-        if has_ci:
-            df_ci = trans_df[(trans_df["checkin_day"] == today_str) & (trans_df["transport_ci"].apply(_is_si))].copy()
-            for _, r in df_ci.iterrows():
-                out_rows.append({"hora": _hora_from_cols(r, "ci"), "accion": "CHECK-IN",
-                                 "apartment": r.get("apartment",""), "guest_name": r.get("guest_name","")})
-        if has_co:
-            df_co = trans_df[(trans_df["checkout_day"] == today_str) & (trans_df["transport_co"].apply(_is_si))].copy()
-            for _, r in df_co.iterrows():
-                out_rows.append({"hora": _hora_from_cols(r, "co"), "accion": "CHECK-OUT",
-                                 "apartment": r.get("apartment",""), "guest_name": r.get("guest_name","")})
-        trans_out = pd.DataFrame(out_rows, columns=["hora","accion","apartment","guest_name"])
-        if trans_out.empty:
-            st.info("No hay transportes para agendar hoy.")
-        else:
-            st.dataframe(trans_out.sort_values(["hora","accion","apartment"]), use_container_width=True)
-    else:
-        st.info("No se encontraron columnas ‘TRANSPORTE CHECK-IN’ / ‘TRANSPORTE CHECK-OUT’ en el archivo.")
-
-    # 🚐📋 Resumen para Motorista — Transportes de hoy
-    st.subheader("🚐📋 Resumen para Motorista — Transportes de hoy")
-
-    def _pick_name(row):
-        g = str(row.get("guest_name","")).strip()
-        if g: return g
-        return str(row.get("nombre","")).strip()
-
-    def _clean_phone(val: str) -> str:
-        s = re.sub(r"\D", "", str(val or ""))
-        if len(s) == 8:  # Panamá sin +507
-            s = "507" + s
-        if s.startswith("00"):  # 00 -> internacional
-            s = s[2:]
-        return s
-
-    def _build_driver_block(df_in, kind):
-        """kind: 'CHECK-IN' o 'CHECK-OUT'."""
-        if df_in.empty:
-            return pd.DataFrame(), []
-        out_rows = []
-        lines = []
-        for _, r in df_in.sort_values(["Hora","Apartamento"]).iterrows():
-            out_rows.append({
-                "Acción": kind,
-                "Fecha": r.get("Fecha",""),
-                "Hora": r.get("Hora",""),
-                "Apartamento": r.get("Apartamento",""),
-                "Nombre": r.get("Nombre",""),
-                "Teléfono": r.get("Teléfono",""),
-                "Notas": r.get("Notas",""),
-            })
-            lines.append(f"• {r.get('Hora','')} {kind} – {r.get('Apartamento','')} – {r.get('Nombre','')} – {r.get('Teléfono','')} – {r.get('Fecha','')} | {r.get('Notas','')}")
-        return pd.DataFrame(out_rows), lines
-
-    base_mov = normalized[(normalized["checkin_day"] == today_str) | (normalized["checkout_day"] == today_str)].copy()
-
-    # Filtros SI transporte
-    if "transport_ci" in base_mov.columns:
-        t_ci = base_mov[(base_mov["checkin_day"] == today_str) & (base_mov["transport_ci"].apply(_is_si))].copy()
-    else:
-        t_ci = pd.DataFrame(columns=base_mov.columns)
-    if "transport_co" in base_mov.columns:
-        t_co = base_mov[(base_mov["checkout_day"] == today_str) & (base_mov["transport_co"].apply(_is_si))].copy()
-    else:
-        t_co = pd.DataFrame(columns=base_mov.columns)
-
-    def _hora_ci(r): return _hora_from_cols(r, "ci")
-    def _hora_co(r): return _hora_from_cols(r, "co")
-
-    # Armar vistas CI
-    if not t_ci.empty:
-        t_ci["hora"] = t_ci.apply(_hora_ci, axis=1)
-        t_ci["fecha"] = t_ci["checkin_day"]
-        t_ci["Nombre"] = t_ci.apply(_pick_name, axis=1)
-        t_ci["Teléfono"] = t_ci.get("phone", pd.Series([""]*len(t_ci))).apply(_clean_phone)
-        t_ci["Notas"] = t_ci.get("notes","").astype(str).fillna("") \
-                        + np.where(t_ci["hora"].astype(str).str.strip() != "", " | Check-In " + t_ci["hora"].astype(str), "")
-        t_ci_view = t_ci[["apartment","Nombre","Teléfono","fecha","hora","Notas"]].rename(
-            columns={"apartment":"Apartamento","fecha":"Fecha","hora":"Hora"}
-        )
-    else:
-        t_ci_view = pd.DataFrame(columns=["Apartamento","Nombre","Teléfono","Fecha","Hora","Notas"])
-
-    # Armar vistas CO
-    if not t_co.empty:
-        t_co["hora"] = t_co.apply(_hora_co, axis=1)
-        t_co["fecha"] = t_co["checkout_day"]
-        t_co["Nombre"] = t_co.apply(_pick_name, axis=1)
-        t_co["Teléfono"] = t_co.get("phone", pd.Series([""]*len(t_co))).apply(_clean_phone)
-        t_co["Notas"] = t_co.get("notes","").astype(str).fillna("") \
-                        + np.where(t_co["hora"].astype(str).str.strip() != "", " | Check-Out " + t_co["hora"].astype(str), "")
-        t_co_view = t_co[["apartment","Nombre","Teléfono","fecha","hora","Notas"]].rename(
-            columns={"apartment":"Apartamento","fecha":"Fecha","hora":"Hora"}
-        )
-    else:
-        t_co_view = pd.DataFrame(columns=["Apartamento","Nombre","Teléfono","Fecha","Hora","Notas"])
-
-    colA, colB = st.columns(2)
-    with colA:
-        st.markdown("**Transportes CHECK-IN (hoy)**")
-        st.dataframe(t_ci_view.sort_values(["Hora","Apartamento"]) if not t_ci_view.empty else t_ci_view,
-                     use_container_width=True)
-    with colB:
-        st.markdown("**Transportes CHECK-OUT (hoy)**")
-        st.dataframe(t_co_view.sort_values(["Hora","Apartamento"]) if not t_co_view.empty else t_co_view,
-                     use_container_width=True)
-
-    # Mensaje WhatsApp para motorista
-    fecha_str = pd.Timestamp(work_date).strftime("%d/%m/%Y")
-    msg_lines = [f"Traslados de hoy – {fecha_str}"]
-    df_ci_msg, ci_lines = _build_driver_block(t_ci_view, "CHECK-IN")
-    df_co_msg, co_lines = _build_driver_block(t_co_view, "CHECK-OUT")
-    if ci_lines:
-        msg_lines.append("\nCHECK-IN:")
-        msg_lines += ci_lines
-    if co_lines:
-        msg_lines.append("\nCHECK-OUT:")
-        msg_lines += co_lines
-    driver_msg = "\n".join(msg_lines) if (ci_lines or co_lines) else "Sin traslados para hoy."
-    st.text_area("Mensaje para Motorista", driver_msg, height=220)
-
-    driver_phone = re.sub(r"\D", "", wa_driver or "")
-    if driver_phone:
-        wa_link_driver = f"https://wa.me/{driver_phone}?text={_q.quote(driver_msg)}"
-        st.markdown(f"[Enviar por WhatsApp al **Motorista**]({wa_link_driver})")
-
-    driver_csv = pd.concat([t_ci_view.assign(Acción="CHECK-IN"), t_co_view.assign(Acción="CHECK-OUT")], ignore_index=True)
-    driver_csv = driver_csv[["Acción","Fecha","Hora","Apartamento","Nombre","Teléfono","Notas"]] if not driver_csv.empty else driver_csv
-    st.download_button("⬇️ Descargar CSV para Motorista", data=driver_csv.to_csv(index=False).encode("utf-8"),
-                       file_name=f"transportes_motorista_{today_str}.csv", mime="text/csv")
-
     # ========================= Resumen + ASIGNACIÓN MANUAL =========================
     st.subheader("🧾 Resumen por apartamento (día) + asignación manual")
     extra_apts = ["BALI"]  # apartamento extra fijo
@@ -755,6 +598,7 @@ with tab1:
         st.info("No hay check-ins para hoy.")
     else:
         st.dataframe(conc_view, use_container_width=True)
+        fecha_str = pd.Timestamp(work_date).strftime("%d/%m/%Y")
         lines = [f"Entradas de hoy – {fecha_str}:"]
         for _, r in conc_view.iterrows():
             hora = str(r.get("checkin_time","")).strip()
@@ -1063,3 +907,174 @@ with tab2:
         avg_ci = _avg_time(month_calc.loc[month_calc["checkin_in_month"]==1, "checkin_time_dt"])
         avg_co = _avg_time(month_calc.loc[month_calc["checkout_in_month"]==1, "checkout_time_dt"])
         st.markdown(f"**Hora promedio** — Check-in: `{avg_ci or '—'}` • Check-out: `{avg_co or '—'}`")
+
+# ====== TAB 3: Transportes ======
+with tab3:
+    st.header("🚐 Resumen de transportes")
+
+    # Parámetros
+    dia_transportes = st.date_input("Día (para mensaje del motorista)", value=work_date, key="t_day")
+    hoy_str = pd.Timestamp(dia_transportes).strftime("%Y-%m-%d")
+
+    mes_transportes = st.date_input("Mes para totales", value=work_date, key="t_month")
+    month_start_t = pd.Timestamp(mes_transportes).replace(day=1).tz_localize(TZ)
+    month_end_t = month_start_t + pd.offsets.MonthBegin(1)
+
+    # Utilidades
+    def _pick_name(row):
+        g = str(row.get("guest_name","")).strip()
+        return g if g else str(row.get("nombre","")).strip()
+
+    def _clean_phone(val: str) -> str:
+        s = re.sub(r"\D", "", str(val or ""))
+        if len(s) == 8: s = "507" + s     # Panamá sin prefijo
+        if s.startswith("00"): s = s[2:]  # 00 -> internacional
+        return s
+
+    def _hora_from_cols(row, kind):
+        if kind == "ci":
+            if "checkin_time" in row and str(row["checkin_time"]).strip():
+                return row["checkin_time"]
+            if "checkin" in row and pd.notna(row["checkin"]):
+                try: return row["checkin"].tz_convert(TZ_NAME).strftime("%H:%M")
+                except Exception: return pd.to_datetime(row["checkin"]).strftime("%H:%M")
+        else:
+            if "checkout_time" in row and str(row["checkout_time"]).strip():
+                return row["checkout_time"]
+            if "checkout" in row and pd.notna(row["checkout"]):
+                try: return row["checkout"].tz_convert(TZ_NAME).strftime("%H:%M")
+                except Exception: return pd.to_datetime(row["checkout"]).strftime("%H:%M")
+        return ""
+
+    # ---------- Día (tablas + WhatsApp) ----------
+    st.subheader("📋 Transportes de HOY (según el día seleccionado)")
+
+    base_mov = normalized[(normalized["checkin_day"] == hoy_str) | (normalized["checkout_day"] == hoy_str)].copy()
+
+    # Filtros SI transporte
+    has_ci = "transport_ci" in base_mov.columns
+    has_co = "transport_co" in base_mov.columns
+
+    if has_ci:
+        t_ci = base_mov[(base_mov["checkin_day"] == hoy_str) & (base_mov["transport_ci"].apply(_is_si))].copy()
+    else:
+        t_ci = pd.DataFrame(columns=base_mov.columns)
+    if has_co:
+        t_co = base_mov[(base_mov["checkout_day"] == hoy_str) & (base_mov["transport_co"].apply(_is_si))].copy()
+    else:
+        t_co = pd.DataFrame(columns=base_mov.columns)
+
+    # Vista CI
+    if not t_ci.empty:
+        t_ci["Hora"] = t_ci.apply(lambda r: _hora_from_cols(r,"ci"), axis=1)
+        t_ci["Fecha"] = t_ci["checkin_day"]
+        t_ci["Nombre"] = t_ci.apply(_pick_name, axis=1)
+        t_ci["Teléfono"] = t_ci.get("phone", pd.Series([""]*len(t_ci))).apply(_clean_phone)
+        t_ci["Notas"] = t_ci.get("notes","").astype(str).fillna("") \
+                        + np.where(t_ci["Hora"].astype(str).str.strip()!="", " | Check-In "+t_ci["Hora"].astype(str), "")
+        t_ci_view = t_ci[["apartment","Nombre","Teléfono","Fecha","Hora","Notas"]].rename(columns={"apartment":"Apartamento"})
+    else:
+        t_ci_view = pd.DataFrame(columns=["Apartamento","Nombre","Teléfono","Fecha","Hora","Notas"])
+
+    # Vista CO
+    if not t_co.empty:
+        t_co["Hora"] = t_co.apply(lambda r: _hora_from_cols(r,"co"), axis=1)
+        t_co["Fecha"] = t_co["checkout_day"]
+        t_co["Nombre"] = t_co.apply(_pick_name, axis=1)
+        t_co["Teléfono"] = t_co.get("phone", pd.Series([""]*len(t_co))).apply(_clean_phone)
+        t_co["Notas"] = t_co.get("notes","").astype(str).fillna("") \
+                        + np.where(t_co["Hora"].astype(str).str.strip()!="", " | Check-Out "+t_co["Hora"].astype(str), "")
+        t_co_view = t_co[["apartment","Nombre","Teléfono","Fecha","Hora","Notas"]].rename(columns={"apartment":"Apartamento"})
+    else:
+        t_co_view = pd.DataFrame(columns=["Apartamento","Nombre","Teléfono","Fecha","Hora","Notas"])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Transportes CHECK-IN (día)**")
+        st.dataframe(t_ci_view.sort_values(["Hora","Apartamento"]) if not t_ci_view.empty else t_ci_view, use_container_width=True)
+    with c2:
+        st.markdown("**Transportes CHECK-OUT (día)**")
+        st.dataframe(t_co_view.sort_values(["Hora","Apartamento"]) if not t_co_view.empty else t_co_view, use_container_width=True)
+
+    # Mensaje WhatsApp (día)
+    fecha_str = pd.Timestamp(dia_transportes).strftime("%d/%m/%Y")
+    msg_lines = [f"Traslados de hoy – {fecha_str}"]
+    def _block_lines(df_in, tag):
+        lines = []
+        for _, r in df_in.sort_values(["Hora","Apartamento"]).iterrows():
+            lines.append(f"• {r['Hora']} {tag} – {r['Apartamento']} – {r['Nombre']} – {r['Teléfono']} – {r['Fecha']} | {r['Notas']}")
+        return lines
+    ci_lines = _block_lines(t_ci_view, "CHECK-IN")
+    co_lines = _block_lines(t_co_view, "CHECK-OUT")
+    if ci_lines: msg_lines += ["", "CHECK-IN:"] + ci_lines
+    if co_lines: msg_lines += ["", "CHECK-OUT:"] + co_lines
+    driver_msg = "\n".join(msg_lines) if (ci_lines or co_lines) else "Sin traslados para hoy."
+    st.text_area("Mensaje para Motorista (día)", driver_msg, height=220)
+
+    driver_phone = re.sub(r"\D", "", wa_driver or "")
+    if driver_phone:
+        st.markdown(f"[Enviar WhatsApp al **Motorista**](https://wa.me/{driver_phone}?text={_q.quote(driver_msg)})")
+
+    csv_day = pd.concat([t_ci_view.assign(Acción="CHECK-IN"), t_co_view.assign(Acción="CHECK-OUT")], ignore_index=True)
+    st.download_button("⬇️ Descargar CSV (día)", data=csv_day.to_csv(index=False).encode("utf-8"),
+                       file_name=f"transportes_{hoy_str}.csv", mime="text/csv")
+
+    st.divider()
+
+    # ---------- Resumen mensual ----------
+    st.subheader("📅 Totales del MES (transportes)")
+
+    # Aseguramos datetimes con zona
+    norm_m = normalized.copy()
+    norm_m["checkin"]  = to_tz(norm_m["checkin"])
+    norm_m["checkout"] = to_tz(norm_m["checkout"])
+
+    # Filtros mensuales
+    if "transport_ci" in norm_m.columns:
+        t_ci_m = norm_m[(norm_m["checkin"]>=month_start_t) & (norm_m["checkin"]<month_end_t) & (norm_m["transport_ci"].apply(_is_si))].copy()
+    else:
+        t_ci_m = pd.DataFrame(columns=norm_m.columns)
+
+    if "transport_co" in norm_m.columns:
+        t_co_m = norm_m[(norm_m["checkout"]>=month_start_t) & (norm_m["checkout"]<month_end_t) & (norm_m["transport_co"].apply(_is_si))].copy()
+    else:
+        t_co_m = pd.DataFrame(columns=norm_m.columns)
+
+    # Formato de vistas
+    def _prep_view_month(df_in, kind):
+        if df_in.empty:
+            return pd.DataFrame(columns=["Fecha","Hora","Acción","Apartamento","Nombre","Teléfono","Notas"])
+        if kind == "CHECK-IN":
+            df_in["Fecha"] = df_in["checkin_day"]
+            df_in["Hora"]  = df_in.apply(lambda r: _hora_from_cols(r,"ci"), axis=1)
+        else:
+            df_in["Fecha"] = df_in["checkout_day"]
+            df_in["Hora"]  = df_in.apply(lambda r: _hora_from_cols(r,"co"), axis=1)
+        df_in["Nombre"] = df_in.apply(_pick_name, axis=1)
+        df_in["Teléfono"] = df_in.get("phone", pd.Series([""]*len(df_in))).apply(_clean_phone)
+        nota_tag = "Check-In " if kind=="CHECK-IN" else "Check-Out "
+        df_in["Notas"] = df_in.get("notes","").astype(str).fillna("") \
+                         + np.where(df_in["Hora"].astype(str).str.strip()!="", " | "+nota_tag+df_in["Hora"].astype(str), "")
+        out = df_in[["Fecha","Hora","apartment","Nombre","Teléfono","Notas"]].rename(columns={"apartment":"Apartamento"})
+        out["Acción"] = kind
+        return out
+
+    ci_month_view = _prep_view_month(t_ci_m, "CHECK-IN")
+    co_month_view = _prep_view_month(t_co_m, "CHECK-OUT")
+    month_view = pd.concat([ci_month_view, co_month_view], ignore_index=True)
+
+    # Métricas
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total CHECK-IN (mes)", len(ci_month_view))
+    c2.metric("Total CHECK-OUT (mes)", len(co_month_view))
+    c3.metric("Total traslados (mes)", len(month_view))
+
+    # Tabla mensual
+    st.dataframe(month_view.sort_values(["Fecha","Hora","Acción","Apartamento"]) if not month_view.empty else month_view,
+                 use_container_width=True)
+
+    # Descarga mensual
+    st.download_button("⬇️ Descargar CSV mensual (transportes)",
+                       data=month_view.to_csv(index=False).encode("utf-8"),
+                       file_name=f"transportes_mes_{month_start_t.strftime('%Y-%m')}.csv",
+                       mime="text/csv")
