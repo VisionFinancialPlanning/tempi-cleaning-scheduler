@@ -1181,4 +1181,125 @@ with tab3:
                      use_container_width=True)
 
     st.subheader("📝 Mensaje general para Motorista (mes)")
-    meses_es = ["]()_
+    meses_es = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
+    titulo_mes = f"{meses_es[month_start_t.month-1].capitalize()} {month_start_t.year}"
+    lines = [f"Traslados del mes — {titulo_mes}"]
+    def _block_lines(df_in, tag):
+        out = []
+        for _, r in df_in.sort_values(["Fecha","Hora","Apartamento"]).iterrows():
+            out.append(f"• {r['Fecha']} {r['Hora']} {tag} – {r['Apartamento']} – {r['Nombre']} – {r['Teléfono']} | {r['Notas']}")
+        return out
+    ci_lines = _block_lines(ci_month_view, "CHECK-IN")
+    co_lines = _block_lines(co_month_view, "CHECK-OUT")
+    if ci_lines: lines += ["", "CHECK-IN:"] + ci_lines
+    if co_lines: lines += ["", "CHECK-OUT:"] + co_lines
+    msg_mes = "\n".join(lines) if (ci_lines or co_lines) else "Sin traslados para este mes."
+    st.text_area("Mensaje (mes)", msg_mes, height=250)
+    driver_phone = re.sub(r"\D", "", wa_driver or "")
+    if driver_phone and (ci_lines or co_lines):
+        st.markdown(f"[Enviar por WhatsApp al **Motorista**](https://wa.me/{driver_phone}?text={_q.quote(msg_mes)})")
+
+    st.subheader("✉️ Mensajes individuales (WhatsApp) — Todo el mes")
+    driver_display = st.text_input("Nombre del motorista para el saludo", value="Balentina", key="t_driver_name")
+
+    def _row_msg_month(r: pd.Series) -> str:
+        nombre = r.get("Nombre","").strip()
+        fecha  = _fecha_es_larga(r.get("Fecha",""))
+        hora   = _hora_12h(r.get("Hora",""))
+        vuelo  = _extract_flight(r.get("Notas",""))
+        if r.get("Acción") == "CHECK-IN":
+            ruta = f"Desde Tocumen hacia {r.get('Apartamento','')}"
+        else:
+            ruta = f"Desde {r.get('Apartamento','')} hacia Tocumen"
+        saludo = f"Hola {driver_display} te comparto los datos" if driver_display else "Te comparto los datos"
+        msg = f"{saludo}\n\n{nombre}\n{fecha}\n{hora}"
+        if vuelo:
+            msg += f"\n{vuelo}"
+        msg += f"\n{ruta}"
+        return msg
+
+    cci, cco = st.columns(2)
+    with cci:
+        st.markdown("**Mensajes – CHECK-IN (mes)**")
+        if ci_month_view.empty:
+            st.info("Sin transportes de check-in este mes.")
+        else:
+            for i, r in ci_month_view.iterrows():
+                txt = _row_msg_month(r)
+                st.text_area(f"CI • {r['Fecha']} {r['Hora']} – {r['Apartamento']} – {r['Nombre']}", txt,
+                             height=120, key=f"ci_msg_m_{i}")
+                if driver_phone:
+                    st.markdown(f"[Enviar a Motorista](https://wa.me/{driver_phone}?text={_q.quote(txt)})")
+    with cco:
+        st.markdown("**Mensajes – CHECK-OUT (mes)**")
+        if co_month_view.empty:
+            st.info("Sin transportes de check-out este mes.")
+        else:
+            for j, r in co_month_view.iterrows():
+                txt = _row_msg_month(r)
+                st.text_area(f"CO • {r['Fecha']} {r['Hora']} – {r['Apartamento']} – {r['Nombre']}", txt,
+                             height=120, key=f"co_msg_m_{j}")
+                if driver_phone:
+                    st.markdown(f"[Enviar a Motorista](https://wa.me/{driver_phone}?text={_q.quote(txt)})")
+
+    st.download_button("⬇️ Descargar CSV mensual (transportes)",
+                       data=month_view.sort_values(["Fecha","Hora","Acción","Apartamento"]).to_csv(index=False).encode("utf-8"),
+                       file_name=f"transportes_mes_{month_start_t.strftime('%Y-%m')}.csv",
+                       mime="text/csv")
+
+    # -------- 📅 Transportes HOY (en este tab) --------
+    st.markdown("---")
+    with st.expander("📅 Transportes de HOY (detalle)"):
+        today_str = pd.Timestamp(work_date).strftime("%Y-%m-%d")
+        if has_ci:
+            t_ci_day = norm_m[(norm_m["checkin_day"] == today_str) & (norm_m["transport_ci"].apply(_is_si))].copy()
+        else:
+            t_ci_day = pd.DataFrame(columns=norm_m.columns)
+        if has_co:
+            t_co_day = norm_m[(norm_m["checkout_day"] == today_str) & (norm_m["transport_co"].apply(_is_si))].copy()
+        else:
+            t_co_day = pd.DataFrame(columns=norm_m.columns)
+
+        def _prep_view_day(df_in, kind):
+            if df_in.empty:
+                return pd.DataFrame(columns=["Hora","Acción","Apartamento","Nombre","Teléfono","Notas"])
+            if kind == "CHECK-IN":
+                df_in["Hora"]  = df_in.apply(lambda r: _hora_from_cols(r,"ci"), axis=1)
+            else:
+                df_in["Hora"]  = df_in.apply(lambda r: _hora_from_cols(r,"co"), axis=1)
+            df_in["Nombre"]   = df_in.apply(_pick_name, axis=1)
+            df_in["Teléfono"] = df_in.get("phone", pd.Series([""]*len(df_in))).apply(_clean_phone)
+            nota_tag = "Check-In " if kind=="CHECK-IN" else "Check-Out "
+            df_in["Notas"] = df_in.get("notes","").astype(str).fillna("") \
+                             + np.where(df_in["Hora"].astype(str).str.strip()!="", " | "+nota_tag+df_in["Hora"].astype(str), "")
+            out = df_in[["Hora","apartment","Nombre","Teléfono","Notas"]].rename(columns={"apartment":"Apartamento"})
+            out["Acción"] = kind
+            return out
+
+        ci_day_view = _prep_view_day(t_ci_day, "CHECK-IN")
+        co_day_view = _prep_view_day(t_co_day, "CHECK-OUT")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**CI de hoy (con transporte)**")
+            st.dataframe(ci_day_view.sort_values(["Hora","Apartamento"]) if not ci_day_view.empty else ci_day_view, use_container_width=True)
+        with col2:
+            st.markdown("**CO de hoy (con transporte)**")
+            st.dataframe(co_day_view.sort_values(["Hora","Apartamento"]) if not co_day_view.empty else co_day_view, use_container_width=True)
+
+        if not ci_day_view.empty or not co_day_view.empty:
+            lines = [f"Traslados de hoy — {pd.Timestamp(work_date).strftime('%d/%m/%Y')}"]
+            def _block_lines_day(df_in, tag):
+                out = []
+                for _, r in df_in.sort_values(["Hora","Apartamento"]).iterrows():
+                    out.append(f"• {r['Hora']} {tag} – {r['Apartamento']} – {r['Nombre']} – {r['Teléfono']} | {r['Notas']}")
+                return out
+            lines += (["", "CHECK-IN:"] + _block_lines_day(ci_day_view, "CHECK-IN")) if not ci_day_view.empty else []
+            lines += (["", "CHECK-OUT:"] + _block_lines_day(co_day_view, "CHECK-OUT")) if not co_day_view.empty else []
+            msg_hoy = "\n".join(lines)
+            st.text_area("Mensaje (hoy)", msg_hoy, height=160, key="msg_driver_hoy_t3")
+            driver_phone = re.sub(r"\D", "", wa_driver or "")
+            if driver_phone:
+                st.markdown(f"[Enviar por WhatsApp al **Motorista**](https://wa.me/{driver_phone}?text={_q.quote(msg_hoy)})")
+        else:
+            st.info("No hay transportes requeridos para hoy.")
