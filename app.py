@@ -9,11 +9,17 @@ from datetime import datetime, time, timedelta
 import pytz
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import streamlit as st
 from pandas.api.types import is_datetime64_any_dtype as _is_dt
+
+# ---- Matplotlib: import a prueba de fallos ----
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    matplotlib = None
+    plt = None
 
 # ==============================
 # CONFIGURACIÓN GLOBAL
@@ -468,6 +474,9 @@ def greedy_assign(jobs_df, employees, buffer_min=10, travel_min=0, early_priorit
 def plot_gantt(df: pd.DataFrame, title, y_key):
     if df is None or df.empty:
         st.info("No hay datos para mostrar."); return
+    if plt is None:
+        st.error("Para ver el gráfico instala matplotlib (añade `matplotlib` a requirements.txt).")
+        return
     fig, ax = plt.subplots(figsize=(11, 3 + 0.35*len(df)))
     labels = list(df[y_key].unique())
     y_map = {e:i for i,e in enumerate(labels)}
@@ -578,7 +587,8 @@ with tab1:
         st.warning("Coordinar recolección en estos apartamentos:")
         st.dataframe(cash_pickups[show_cols], use_container_width=True)
 
-    st.subheader("🧾 Resumen por apartamento (día) + asignación manual")
+    # --- Resumen por apartamento
+    st.subheader("🧾 Resumen por apartamento (día)")
     extra_apts = ["BALI"]  # apartamento extra fijo
     summary_df = day_summary_collapsed_v2(normalized, work_date, day_start_t, day_end_t, extra_apts)
     st.dataframe(summary_df, use_container_width=True)
@@ -616,10 +626,14 @@ with tab1:
         st.download_button("⬇️ Descargar CSV para Conserje", data=csv_bytes,
                            file_name=f"checkins_todos_{today_str}.csv", mime="text/csv")
 
+    # --- Asignación manual (permite 1 o 2 empleadas por apartamento)
     st.markdown("**Asigna quién y a qué hora limpiar (manual)**")
     win_df = build_apartment_windows_v2(normalized, work_date, day_start_t, day_end_t, extra_apts)
     win_map = {r["apartment"]: r for _, r in win_df.iterrows()}
-    def _fmt(t): return t.tz_convert(TZ_NAME).strftime("%H:%M") if pd.notna(t) else ""
+
+    def _fmt(t): 
+        try: return t.tz_convert(TZ_NAME).strftime("%H:%M")
+        except Exception: return ""
 
     base_rows = []
     for _, r in summary_df.iterrows():
@@ -632,7 +646,8 @@ with tab1:
             "tipo": r["tipo"],
             "ventana_inicio": v_ini_str,
             "ventana_fin": v_fin_str,
-            "empleado": "—",
+            "empleado1": "—",
+            "empleado2": "—",
             "inicio": "",
             "fin": ""
         })
@@ -646,6 +661,7 @@ with tab1:
             out.append(cur.strftime("%H:%M"))
             cur += timedelta(minutes=step_min)
         return out
+
     time_options = _time_opts(day_start_t, day_end_t, 15)
     employee_options = ["—", emp1_name, emp2_name]
 
@@ -656,7 +672,8 @@ with tab1:
             "tipo": st.column_config.Column("tipo", disabled=True),
             "ventana_inicio": st.column_config.Column("ventana_inicio", disabled=True),
             "ventana_fin": st.column_config.Column("ventana_fin", disabled=True),
-            "empleado": st.column_config.SelectboxColumn("empleado", options=employee_options),
+            "empleado1": st.column_config.SelectboxColumn("empleado1", options=employee_options),
+            "empleado2": st.column_config.SelectboxColumn("empleado2", options=employee_options),
             "inicio": st.column_config.SelectboxColumn("inicio", options=time_options),
             "fin": st.column_config.SelectboxColumn("fin", options=time_options),
         },
@@ -672,27 +689,34 @@ with tab1:
 
     manual_rows = []
     for _, r in edited.iterrows():
-        emp = r.get("empleado", "—")
-        s = _to_dt(work_date, r.get("inicio","")); e = _to_dt(work_date, r.get("fin",""))
-        if emp != "—" and pd.notna(s) and pd.notna(e) and e > s:
-            manual_rows.append({
-                "employee": emp,
-                "apartment": r["apartment"],
-                "start": s,
-                "end": e,
-                "duration_min": int((e - s).total_seconds()//60)
-            })
+        s = _to_dt(work_date, r.get("inicio",""))
+        e = _to_dt(work_date, r.get("fin",""))
+        if pd.notna(s) and pd.notna(e) and e > s:
+            seleccion = [r.get("empleado1","—"), r.get("empleado2","—")]
+            seleccion = [x for x in seleccion if x != "—"]
+            seleccion = list(dict.fromkeys(seleccion))  # dedup
+            for emp in seleccion:
+                manual_rows.append({
+                    "employee": emp,
+                    "apartment": r["apartment"],
+                    "start": s,
+                    "end": e,
+                    "duration_min": int((e - s).total_seconds()//60)
+                })
+
     manual_plan = pd.DataFrame(manual_rows)
 
+    # --- Gantt manual
     st.subheader("🗓️ Gantt manual (según tus horas)")
     if manual_plan.empty:
-        st.info("Asigna empleado e intervalos (inicio/fin) para ver el Gantt.")
+        st.info("Asigna empleado(s) e intervalos (inicio/fin) para ver el Gantt.")
     else:
         plot_gantt(manual_plan, title="Plan Manual de Limpieza (Gantt)", y_key="employee")
 
+    # --- WhatsApp según plan manual
     st.subheader("💬 Mensajes de WhatsApp (según plan manual)")
     if manual_plan.empty:
-        st.info("Asigna empleado e intervalos (inicio/fin) en la tabla para generar los mensajes.")
+        st.info("Asigna empleado(s) e intervalos (inicio/fin) en la tabla para generar los mensajes.")
     else:
         plan_msg = manual_plan.merge(summary_df[["apartment","tipo"]], on="apartment", how="left")
 
@@ -736,23 +760,27 @@ with tab1:
                 wa_link = f"https://wa.me/{phone_digits}?text={_q.quote(msg)}"
                 st.markdown(f"[Abrir WhatsApp de **{emp}**]({wa_link})")
 
+    # --- Ventanas por apartamento (info)
     st.subheader("🏠 Ventanas disponibles por apartamento (info)")
     windows_df = build_apartment_windows_v2(normalized, work_date, day_start_t, day_end_t, extra_apts)
     if windows_df.empty:
         st.info("No hay ventanas disponibles para el día seleccionado.")
     else:
-        fig, ax = plt.subplots(figsize=(11, 3 + 0.35*len(windows_df)))
-        apartments = list(windows_df["apartment"].unique()); y_map = {a:i for i,a in enumerate(apartments)}
-        day0 = windows_df["start"].min().replace(hour=0, minute=0, second=0, microsecond=0)
-        for _, row in windows_df.iterrows():
-            y = y_map[row["apartment"]]
-            left = (row["start"] - day0).total_seconds()/3600
-            width = (row["end"] - row["start"]).total_seconds()/3600
-            ax.barh(y, width, left=left)
-            ax.text(left+width/2, y, row["kind"], va="center", ha="center", fontsize=9)
-        ax.set_yticks(range(len(apartments))); ax.set_yticklabels(apartments)
-        ax.set_xlabel("Horas del día"); ax.set_title("Ventanas libres para limpieza")
-        st.pyplot(fig)
+        if plt is None:
+            st.error("Para ver el gráfico instala matplotlib (añade `matplotlib` a requirements.txt).")
+        else:
+            fig, ax = plt.subplots(figsize=(11, 3 + 0.35*len(windows_df)))
+            apartments = list(windows_df["apartment"].unique()); y_map = {a:i for i,a in enumerate(apartments)}
+            day0 = windows_df["start"].min().replace(hour=0, minute=0, second=0, microsecond=0)
+            for _, row in windows_df.iterrows():
+                y = y_map[row["apartment"]]
+                left = (row["start"] - day0).total_seconds()/3600
+                width = (row["end"] - row["start"]).total_seconds()/3600
+                ax.barh(y, width, left=left)
+                ax.text(left+width/2, y, row["kind"], va="center", ha="center", fontsize=9)
+            ax.set_yticks(range(len(apartments))); ax.set_yticklabels(apartments)
+            ax.set_xlabel("Horas del día"); ax.set_title("Ventanas libres para limpieza")
+            st.pyplot(fig)
 
     with st.expander("⚙️ Plan automático (opcional)"):
         def build_cleaning_jobs_v2(normalized: pd.DataFrame, day, default_duration: int, mop_minutes: int,
@@ -852,7 +880,7 @@ with tab2:
         c1,c2,c3,c4,c5,c6 = st.columns(6)
         c1.metric("Noches", f"{int(apt_group['nights'].sum())}")
         c2.metric("Ingresos", f"${float(apt_group['revenue'].sum()):,.2f}")
-        adr_global = float(apt_group["revenue"].sum())/float(max(1, apt_group["nights"].sum()))
+        adr_global = float(apt_group["revenue"].sum())/float(max(1, apt_group['nights'].sum()))
         c3.metric("ADR", f"${adr_global:,.2f}")
         c4.metric("Check-ins", f"{int(apt_group['checkins'].sum())}")
         c5.metric("Check-outs", f"{int(apt_group['checkouts'].sum())}")
@@ -864,21 +892,27 @@ with tab2:
 
         # Ingresos por apartamento
         st.markdown("**Ingresos por apartamento**")
-        y = apt_group["apartment"].fillna("—").astype(str)
-        x = pd.to_numeric(apt_group["revenue"], errors="coerce").fillna(0.0)
-        fig, ax = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
-        ax.barh(y, x)
-        ax.set_xlabel("USD"); ax.set_ylabel("Apartamento"); ax.set_title("Ingresos del mes (prorrateados)")
-        st.pyplot(fig)
+        if plt is None:
+            st.error("Para ver el gráfico instala matplotlib (añade `matplotlib` a requirements.txt).")
+        else:
+            y = apt_group["apartment"].fillna("—").astype(str)
+            x = pd.to_numeric(apt_group["revenue"], errors="coerce").fillna(0.0)
+            fig, ax = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
+            ax.barh(y, x)
+            ax.set_xlabel("USD"); ax.set_ylabel("Apartamento"); ax.set_title("Ingresos del mes (prorrateados)")
+            st.pyplot(fig)
 
         # Noches por apartamento
         st.markdown("**Noches por apartamento**")
-        y2 = apt_group["apartment"].fillna("—").astype(str)
-        x2 = pd.to_numeric(apt_group["nights"], errors="coerce").fillna(0)
-        fig2, ax2 = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
-        ax2.barh(y2, x2)
-        ax2.set_xlabel("Noches"); ax2.set_ylabel("Apartamento"); ax2.set_title("Noches del mes")
-        st.pyplot(fig2)
+        if plt is None:
+            st.error("Para ver el gráfico instala matplotlib (añade `matplotlib` a requirements.txt).")
+        else:
+            y2 = apt_group["apartment"].fillna("—").astype(str)
+            x2 = pd.to_numeric(apt_group["nights"], errors="coerce").fillna(0)
+            fig2, ax2 = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
+            ax2.barh(y2, x2)
+            ax2.set_xlabel("Noches"); ax2.set_ylabel("Apartamento"); ax2.set_title("Noches del mes")
+            st.pyplot(fig2)
 
         # Mix de canal
         ch_counts = month_calc.copy()
