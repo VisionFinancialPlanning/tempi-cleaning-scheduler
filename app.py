@@ -97,6 +97,12 @@ def _find_col(df: pd.DataFrame, aliases):
             if an in key: return real
     return None
 
+def _parse_date_flex(series):
+    """Prueba dayfirst False/True y elige el que más aciertos tenga."""
+    s1 = pd.to_datetime(series, errors="coerce", dayfirst=False)
+    s2 = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    return s2 if s2.notna().sum() > s1.notna().sum() else s1
+
 def _coerce_time(series):
     if series is None: return pd.Series(dtype="object")
     def parse_one(v):
@@ -125,17 +131,18 @@ def _coerce_time(series):
     return series.apply(parse_one)
 
 def _time_from_datecol(date_s):
-    dates = pd.to_datetime(date_s, errors="coerce")
+    dates = _parse_date_flex(date_s)
     out = []
     for d in dates:
-        if pd.isna(d): out.append(None)
+        if pd.isna(d):
+            out.append(None)
         else:
             hh, mm, ss = d.hour, d.minute, d.second
             out.append(None if (hh, mm, ss) == (0, 0, 0) else time(hh, mm, ss))
     return pd.Series(out, index=dates.index)
 
 def _combine_smart(date_s, explicit_time_s, default_time: time):
-    dates = pd.to_datetime(date_s, errors="coerce")
+    dates = _parse_date_flex(date_s)
     t1 = _coerce_time(explicit_time_s) if explicit_time_s is not None else pd.Series([None]*len(dates))
     t2 = _time_from_datecol(date_s)
     out = []
@@ -266,14 +273,27 @@ def _extract_flight(notes: str) -> str:
 # PARSEO DEL EXCEL
 # ==============================
 def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if _find_col(df, ["Check-In"]) is None or _find_col(df, ["Check-Out"]) is None:
-        raise ValueError("El archivo debe incluir al menos 'Check-In' y 'Check-Out'.")
+    # Columnas de fecha (alias amplios español/inglés)
+    ci_date_col = _find_col(df, [
+        "Check-In","fecha check in","fecha checkin","fecha de check in",
+        "fecha de check-in","check in","check-in","fecha ingreso","entrada","fecha entrada"
+    ])
+    co_date_col = _find_col(df, [
+        "Check-Out","fecha check out","fecha checkout","fecha de check out",
+        "fecha de check-out","check out","check-out","fecha salida","salida","fecha de salida"
+    ])
+    if ci_date_col is None or co_date_col is None:
+        raise ValueError("El archivo debe incluir columnas de fecha de entrada y salida (Check-In / Check-Out o equivalentes).")
 
-    ci_date_col = _find_col(df, ["Check-In"])
-    co_date_col = _find_col(df, ["Check-Out"])
-
-    ci_time_col = _find_col(df, ["Check-In Hora","hora entrada","Hora Entrada","Hora Check In","Check-In Time","Hora Check-In"])
-    co_time_col = _find_col(df, ["Check-Out Hora","hora salida","Hora Salida","Hora Check Out","Check-Out Time","Hora Check-Out"])
+    # Columnas de hora (alias amplios)
+    ci_time_col = _find_col(df, [
+        "Check-In Hora","hora entrada","Hora Entrada","Hora Check In",
+        "Check-In Time","Hora Check-In","CHECK-IN HORA","hora de entrada"
+    ])
+    co_time_col = _find_col(df, [
+        "Check-Out Hora","hora salida","Hora Salida","Hora Check Out",
+        "Check-Out Time","Hora Check-Out","CHECK-OUT HORA","hora de salida"
+    ])
 
     ci_dt = _combine_smart(df[ci_date_col], df[ci_time_col] if ci_time_col else None, default_time=time(15,0))
     co_dt = _combine_smart(df[co_date_col], df[co_time_col] if co_time_col else None, default_time=time(12,0))
@@ -288,13 +308,13 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame()
 
-    apt_col   = _find_col(df, ["Property Internal Name"])
-    guest_col = _find_col(df, ["Guest First Name"])
+    apt_col   = _find_col(df, ["Property Internal Name","Apto","Apartamento","Unidad"])
+    guest_col = _find_col(df, ["Guest First Name","Nombre","Name","Guest Name"])
     if apt_col:   out["apartment"]  = df[apt_col].apply(_canon_apt)
     if guest_col: out["guest_name"] = df[guest_col].astype(str)
 
     map_optional = {
-        "number_guests": ["NUMBER GUESTS","Guests","# Guests","Numero Huespedes","Nº Huespedes"],
+        "number_guests": ["NUMBER GUESTS","Guests","# Guests","Numero Huespedes","Nº Huespedes","Huéspedes"],
         "sofa_or_bed":   ["SOFA OR BED","Sofa Bed","Sofa cama","Sofacama","Sofa as Bed"],
         "reservation_id":["ID","Reservation ID","Booking ID","Código","Codigo"],
         "transporte":    ["TRANSPORTE","Transport","Pickup","Transfer"],
@@ -312,6 +332,7 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
         c = _find_col(df, aliases)
         if c: out[new_col] = df[c]
 
+    # Transporte por evento
     trans_ci_col = _find_col(df, ["TRANSPORTE CHECK-IN", "Transporte Check-In", "Transporte Check In", "Pickup Check-In", "Transfer Check-In"])
     trans_co_col = _find_col(df, ["TRANSPORTE CHECK-OUT", "Transporte Check-Out", "Transporte Check Out", "Pickup Check-Out", "Transfer Check-Out"])
     if trans_ci_col: out["transport_ci"] = df[trans_ci_col]
@@ -385,8 +406,9 @@ def _events_por_apartamento(normalized: pd.DataFrame, day, day_start_t: time, da
     out = {}
     for apt in apts:
         sub = df[df["apartment"].astype(str) == apt]
-        cis = [ts for ts in sub["checkin"].dropna()  if start_of_day <= ts < end_of_day]   # check-ins de HOY (rango horario)
-        cos = [ts for ts in sub["checkout"].dropna() if start_of_day <= ts < end_of_day]   # check-outs de HOY (rango horario)
+        # HOY por rango horario (evita fallos por tz u horas en celda)
+        cis = [ts for ts in sub["checkin"].dropna()  if start_of_day <= ts < end_of_day]
+        cos = [ts for ts in sub["checkout"].dropna() if start_of_day <= ts < end_of_day]
         cis = sorted([ts.tz_convert(TZ_NAME) for ts in cis])
         cos = sorted([ts.tz_convert(TZ_NAME) for ts in cos])
 
@@ -447,19 +469,17 @@ def build_apartment_windows_v2(normalized: pd.DataFrame, day, day_start_t: time,
     out = out.sort_values(["__bali__", "apartment"]).drop(columns="__bali__").reset_index(drop=True)
     return out
 
-# ---- NUEVO: Estacionamientos activos de HOY (incluye check-ins antiguos) ----
+# ---- Estacionamientos activos de HOY (incluye check-ins antiguos) ----
 def active_parkings_today(normalized: pd.DataFrame, day, day_start_t: time, day_end_t: time) -> pd.DataFrame:
     start_of_day, end_of_day = _day_bounds(day, day_start_t, day_end_t)
     df = normalized.copy()
     df["checkin"]  = to_tz(df["checkin"])
     df["checkout"] = to_tz(df["checkout"])
     df["parking_count"] = pd.to_numeric(df.get("parking_count", 0), errors="coerce").fillna(0).astype(int)
-    # Ocupados hoy + con parking
     occ = df[(df["checkin"] < end_of_day) & (df["checkout"] > start_of_day) & (df["parking_count"] > 0)].copy()
     if occ.empty:
         return pd.DataFrame(columns=["apartment","guest_name","parking_count","checkin","checkout",
                                      "checkin_day","checkin_time","checkout_day","checkout_time"])
-    # columnas de fecha/hora legibles
     occ["checkin_day"]   = occ["checkin"].dt.strftime("%Y-%m-%d")
     occ["checkin_time"]  = occ["checkin"].dt.strftime("%H:%M")
     occ["checkout_day"]  = occ["checkout"].dt.strftime("%Y-%m-%d")
@@ -579,7 +599,7 @@ with st.sidebar:
 # CARGA
 # ==============================
 uploaded = st.file_uploader(
-    "Sube tu Excel (.xlsx). Requeridas: 'Check-In', 'Check-Out' (horas con alias aceptados).",
+    "Sube tu Excel (.xlsx). Requeridas: 'Check-In'/'Check-Out' o equivalentes (horas con alias aceptados).",
     type=["xlsx"]
 )
 if uploaded is not None:
@@ -726,7 +746,6 @@ with tab1:
     else:
         conc_df["tipo"] = "Solo Check-In"
 
-    # Estacionamiento según activos del día:
     def _est_text(apt):
         n = int(apt_parking_count_map.get(apt, 0))
         return "No" if n <= 0 else f"Sí (x{n})"
@@ -758,7 +777,7 @@ with tab1:
         if phone_digits:
             st.markdown(f"[Enviar por WhatsApp al **Conserje**](https://wa.me/{phone_digits}?text={_q.quote(concierge_msg)})")
 
-    # --- Asignación manual (usa parking ACTIVO por apto)
+    # --- Asignación manual (dos empleadas) con parking activo
     st.markdown("**Asigna quién y a qué hora limpiar (manual)**")
     win_df = build_apartment_windows_v2(normalized, work_date, day_start_t, day_end_t, extra_apts=["BALI"])
     win_map = {r["apartment"]: r for _, r in win_df.iterrows()}
@@ -792,10 +811,6 @@ with tab1:
             cur += timedelta(minutes=step_min)
         return out
     time_options = _time_opts(day_start_t, day_end_t, 15)
-    employee_options = ["—", st.session_state.get("emp1_name", "Mayerlin"), st.session_state.get("emp2_name","Evelyn")]
-    employee_options = ["—", (st.session_state.get("emp1_name") or "Mayerlin"), (st.session_state.get("emp2_name") or "Evelyn")]
-    # Aseguremos nombres actuales
-    employee_options = ["—", (st.session_state.get("emp1_name") or emp1_name), (st.session_state.get("emp2_name") or emp2_name)]
 
     edited = st.data_editor(
         base_df,
@@ -883,7 +898,6 @@ with tab1:
                 if not win_df.empty: win_df.to_excel(writer, index=False, sheet_name="Ventanas")
                 if not prep_df.empty: prep_df.to_excel(writer, index=False, sheet_name="Preparación")
                 if not cash_pickups.empty: cash_pickups.to_excel(writer, index=False, sheet_name="CASH")
-                # Estacionamientos activos
                 if not active_pk.empty: active_pk.to_excel(writer, index=False, sheet_name="ParkingActivo")
             st.download_button("⬇️ Descargar Excel (plan del día)",
                                data=excel_buffer.getvalue(),
@@ -909,7 +923,7 @@ with tab1:
                 if y < margin + 2*cm:
                     c.showPage(); y = H - margin; c.setFont("Helvetica", 10)
                 c.drawString(margin, y, line); y -= 0.35*cm
-            # Sección Parking Activo
+            # Parking Activo
             y -= 0.5*cm; c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, "Estacionamientos activos hoy"); y -= 0.5*cm
             c.setFont("Helvetica", 10)
             if active_pk.empty:
@@ -947,8 +961,315 @@ with tab1:
             ax.set_xlabel("Horas del día"); ax.set_title("Ventanas libres para limpieza")
             st.pyplot(fig)
 
-    # (Plan automático opcional: igual que antes — omitido por brevedad en UI)
+# ====== TAB 2: Analítica mensual ======
+with tab2:
+    st.subheader("Parámetros de análisis")
+    month_anchor = st.date_input("Mes a analizar", value=work_date)
+    month_start = pd.Timestamp(month_anchor).replace(day=1).tz_localize(TZ)
+    next_month = (month_start + pd.offsets.MonthBegin(1))
+    month_end = next_month
 
-# ====== TAB 2 y TAB 3 ======
-# (se conservan iguales a tu última versión; no es necesario tocarlos para este cambio)
-# Para ahorrar espacio aquí omití repetirlos. Si prefieres, puedo re-enviarte el archivo completo con las 3 pestañas idénticas.
+    def _booking_revenue(row):
+        v = _parse_money(row.get("amount_due", np.nan))
+        if np.isnan(v): v = _parse_money(row.get("total_price", np.nan))
+        return v
+
+    def _nights_overlap(ci, co, start, end):
+        if pd.isna(ci) or pd.isna(co): return 0
+        a = max(ci, start); b = min(co, end)
+        if b <= a: return 0
+        return int((b - a).days)
+
+    normalized["checkin"]  = to_tz(normalized["checkin"])
+    normalized["checkout"] = to_tz(normalized["checkout"])
+
+    rows = []
+    for _, r in normalized.iterrows():
+        apt = r.get("apartment","Apto")
+        ci, co = r.get("checkin", pd.NaT), r.get("checkout", pd.NaT)
+        nights_total = r.get("nights", None)
+        nights_total = int(nights_total) if pd.notna(nights_total) else None
+        rev_total = _booking_revenue(r)
+        overlap_nights = _nights_overlap(ci, co, month_start, month_end)
+        nightly_rate = (rev_total / nights_total) if (rev_total and nights_total and nights_total > 0) else np.nan
+        rev_in_month = overlap_nights * nightly_rate if not np.isnan(nightly_rate) else (rev_total if overlap_nights>0 and (nights_total in [None,0]) else np.nan)
+
+        rows.append({
+            "apartment": apt,
+            "overlap_nights": overlap_nights,
+            "rev_in_month": rev_in_month if pd.notna(rev_in_month) else 0.0,
+            "checkin_in_month": 1 if (pd.notna(ci) and (month_start <= ci < month_end)) else 0,
+            "checkout_in_month": 1 if (pd.notna(co) and (month_start <= co < month_end)) else 0,
+            "channel": r.get("channel", None),
+            "cash_pickup": bool(r.get("cash_pickup", False) and (pd.notna(co) and (month_start <= co < month_end))),
+            "cash_amount": _parse_money(r.get("cash_amount", np.nan)) if (r.get("cash_pickup", False) and pd.notna(r.get("cash_amount", np.nan))) else np.nan,
+            "checkin_time_dt": ci,
+            "checkout_time_dt": co,
+        })
+    month_calc = pd.DataFrame(rows)
+
+    if month_calc.empty:
+        st.info("No hay reservas para el mes seleccionado.")
+    else:
+        days_in_month = (month_end - month_start).days
+        apt_group = month_calc.groupby("apartment", dropna=False).agg(
+            nights=("overlap_nights","sum"),
+            revenue=("rev_in_month","sum"),
+            checkins=("checkin_in_month","sum"),
+            checkouts=("checkout_in_month","sum"),
+            cash_pickups=("cash_pickup","sum"),
+            cash_amount=("cash_amount", lambda s: np.nansum(s))
+        ).reset_index()
+        apt_group["ADR"] = (apt_group["revenue"] / apt_group["nights"]).replace([np.inf, -np.inf], np.nan)
+        apt_group["occupancy_%"] = (apt_group["nights"] / days_in_month * 100).round(1)
+
+        c1,c2,c3,c4,c5,c6 = st.columns(6)
+        c1.metric("Noches", f"{int(apt_group['nights'].sum())}")
+        c2.metric("Ingresos", f"${float(apt_group['revenue'].sum()):,.2f}")
+        adr_global = float(apt_group["revenue"].sum())/float(max(1, apt_group['nights'].sum()))
+        c3.metric("ADR", f"${adr_global:,.2f}")
+        c4.metric("Check-ins", f"{int(apt_group['checkins'].sum())}")
+        c5.metric("Check-outs", f"{int(apt_group['checkouts'].sum())}")
+        c6.metric("Cash a recoger", f"${float(np.nansum(apt_group['cash_amount'])):,.2f} ({int(apt_group['cash_pickups'].sum())})")
+
+        st.markdown("**Tabla por apartamento**")
+        show_cols = ["apartment","nights","revenue","ADR","occupancy_%","checkins","checkouts","cash_pickups","cash_amount"]
+        st.dataframe(apt_group[show_cols].sort_values("revenue", ascending=False), use_container_width=True)
+
+        # Ingresos por apartamento
+        st.markdown("**Ingresos por apartamento**")
+        if plt is None:
+            st.error("Para ver el gráfico instala matplotlib (añade `matplotlib` a requirements.txt).")
+        else:
+            y = apt_group["apartment"].fillna("—").astype(str)
+            x = pd.to_numeric(apt_group["revenue"], errors="coerce").fillna(0.0)
+            fig, ax = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
+            ax.barh(y, x)
+            ax.set_xlabel("USD"); ax.set_ylabel("Apartamento"); ax.set_title("Ingresos del mes (prorrateados)")
+            st.pyplot(fig)
+
+        # Noches por apartamento
+        st.markdown("**Noches por apartamento**")
+        if plt is None:
+            st.error("Para ver el gráfico instala matplotlib (añade `matplotlib` a requirements.txt).")
+        else:
+            y2 = apt_group["apartment"].fillna("—").astype(str)
+            x2 = pd.to_numeric(apt_group["nights"], errors="coerce").fillna(0)
+            fig2, ax2 = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
+            ax2.barh(y2, x2)
+            ax2.set_xlabel("Noches"); ax2.set_ylabel("Apartamento"); ax2.set_title("Noches del mes")
+            st.pyplot(fig2)
+
+        # Mix de canal
+        ch_counts = month_calc.copy()
+        ch_counts["has_night"] = ch_counts["overlap_nights"] > 0
+        ch_counts = ch_counts[ch_counts["has_night"]]
+        if not ch_counts.empty and "channel" in ch_counts.columns:
+            mix = ch_counts.groupby("channel").size().reset_index(name="reservas")
+            st.markdown("**Mix de canal (reservas con noches en el mes)**")
+            st.dataframe(mix.sort_values("reservas", ascending=False), use_container_width=True)
+
+        # Horas promedio
+        def _avg_time(series_dt):
+            s = series_dt.dropna()
+            if s.empty: return None
+            mins = s.dt.hour*60 + s.dt.minute
+            m = int(mins.mean())
+            return f"{m//60:02d}:{m%60:02d}"
+        avg_ci = _avg_time(month_calc.loc[month_calc["checkin_in_month"]==1, "checkin_time_dt"])
+        avg_co = _avg_time(month_calc.loc[month_calc["checkout_in_month"]==1, "checkout_time_dt"])
+        st.markdown(f"**Hora promedio** — Check-in: `{avg_ci or '—'}` • Check-out: `{avg_co or '—'}`")
+
+# ====== TAB 3: Transportes (MES COMPLETO + HOY) ======
+with tab3:
+    st.header("🚐 Resumen de transportes (MES)")
+
+    mes_transportes = st.date_input("Mes a analizar (transportes)", value=work_date, key="t_month_all")
+    month_start_t = pd.Timestamp(mes_transportes).replace(day=1).tz_localize(TZ)
+    month_end_t   = month_start_t + pd.offsets.MonthBegin(1)
+
+    norm_m = normalized.copy()
+    norm_m["checkin"]  = to_tz(norm_m["checkin"])
+    norm_m["checkout"] = to_tz(norm_m["checkout"])
+
+    has_ci = "transport_ci" in norm_m.columns
+    has_co = "transport_co" in norm_m.columns
+
+    if has_ci:
+        t_ci_m = norm_m[
+            (norm_m["checkin"]>=month_start_t) & (norm_m["checkin"]<month_end_t) & (norm_m["transport_ci"].apply(_is_si))
+        ].copy()
+    else:
+        t_ci_m = pd.DataFrame(columns=norm_m.columns)
+
+    if has_co:
+        t_co_m = norm_m[
+            (norm_m["checkout"]>=month_start_t) & (norm_m["checkout"]<month_end_t) & (norm_m["transport_co"].apply(_is_si))
+        ].copy()
+    else:
+        t_co_m = pd.DataFrame(columns=norm_m.columns)
+
+    def _prep_view_month(df_in, kind):
+        if df_in.empty:
+            return pd.DataFrame(columns=["Fecha","Hora","Acción","Apartamento","Nombre","Teléfono","Notas"])
+        if kind == "CHECK-IN":
+            df_in["Fecha"] = df_in["checkin"].dt.strftime("%Y-%m-%d")
+            df_in["Hora"]  = df_in.apply(lambda r: _hora_from_cols(r,"ci"), axis=1)
+        else:
+            df_in["Fecha"] = df_in["checkout"].dt.strftime("%Y-%m-%d")
+            df_in["Hora"]  = df_in.apply(lambda r: _hora_from_cols(r,"co"), axis=1)
+        df_in["Nombre"]   = df_in.apply(_pick_name, axis=1)
+        df_in["Teléfono"] = df_in.get("phone", pd.Series([""]*len(df_in))).apply(_clean_phone)
+        nota_tag = "Check-In " if kind=="CHECK-IN" else "Check-Out "
+        df_in["Notas"] = df_in.get("notes","").astype(str).fillna("") \
+                         + np.where(df_in["Hora"].astype(str).str.strip()!="", " | "+nota_tag+df_in["Hora"].astype(str), "")
+        out = df_in[["Fecha","Hora","apartment","Nombre","Teléfono","Notas"]].rename(columns={"apartment":"Apartamento"})
+        out["Acción"] = kind
+        return out
+
+    ci_month_view = _prep_view_month(t_ci_m, "CHECK-IN")
+    co_month_view = _prep_view_month(t_co_m, "CHECK-OUT")
+    month_view = pd.concat([ci_month_view, co_month_view], ignore_index=True)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total CHECK-IN (mes)", len(ci_month_view))
+    c2.metric("Total CHECK-OUT (mes)", len(co_month_view))
+    c3.metric("Total traslados (mes)", len(month_view))
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("**Transportes CHECK-IN (mes)**")
+        st.dataframe(ci_month_view.sort_values(["Fecha","Hora","Apartamento"]) if not ci_month_view.empty else ci_month_view,
+                     use_container_width=True)
+    with colB:
+        st.markdown("**Transportes CHECK-OUT (mes)**")
+        st.dataframe(co_month_view.sort_values(["Fecha","Hora","Apartamento"]) if not co_month_view.empty else co_month_view,
+                     use_container_width=True)
+
+    st.subheader("📝 Mensaje general para Motorista (mes)")
+    meses_es = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
+    titulo_mes = f"{meses_es[month_start_t.month-1].capitalize()} {month_start_t.year}"
+    lines = [f"Traslados del mes — {titulo_mes}"]
+    def _block_lines(df_in, tag):
+        out = []
+        for _, r in df_in.sort_values(["Fecha","Hora","Apartamento"]).iterrows():
+            out.append(f"• {r['Fecha']} {r['Hora']} {tag} – {r['Apartamento']} – {r['Nombre']} – {r['Teléfono']} | {r['Notas']}")
+        return out
+    ci_lines = _block_lines(ci_month_view, "CHECK-IN")
+    co_lines = _block_lines(co_month_view, "CHECK-OUT")
+    if ci_lines: lines += ["", "CHECK-IN:"] + ci_lines
+    if co_lines: lines += ["", "CHECK-OUT:"] + co_lines
+    msg_mes = "\n".join(lines) if (ci_lines or co_lines) else "Sin traslados para este mes."
+    st.text_area("Mensaje (mes)", msg_mes, height=250)
+    driver_phone = re.sub(r"\D", "", (wa_driver or ""))
+    if driver_phone and (ci_lines or co_lines):
+        st.markdown(f"[Enviar por WhatsApp al **Motorista**](https://wa.me/{driver_phone}?text={_q.quote(msg_mes)})")
+
+    st.subheader("✉️ Mensajes individuales (WhatsApp) — Todo el mes")
+    driver_display = st.text_input("Nombre del motorista para el saludo", value="Balentina", key="t_driver_name")
+
+    def _row_msg_month(r: pd.Series) -> str:
+        nombre = r.get("Nombre","").strip()
+        fecha  = _fecha_es_larga(r.get("Fecha",""))
+        hora   = _hora_12h(r.get("Hora",""))
+        vuelo  = _extract_flight(r.get("Notas",""))
+        if r.get("Acción") == "CHECK-IN":
+            ruta = f"Desde Tocumen hacia {r.get('Apartamento','')}"
+        else:
+            ruta = f"Desde {r.get('Apartamento','')} hacia Tocumen"
+        saludo = f"Hola {driver_display} te comparto los datos" if driver_display else "Te comparto los datos"
+        msg = f"{saludo}\n\n{nombre}\n{fecha}\n{hora}"
+        if vuelo:
+            msg += f"\n{vuelo}"
+        msg += f"\n{ruta}"
+        return msg
+
+    cci, cco = st.columns(2)
+    with cci:
+        st.markdown("**Mensajes – CHECK-IN (mes)**")
+        if ci_month_view.empty:
+            st.info("Sin transportes de check-in este mes.")
+        else:
+            for i, r in ci_month_view.iterrows():
+                txt = _row_msg_month(r)
+                st.text_area(f"CI • {r['Fecha']} {r['Hora']} – {r['Apartamento']} – {r['Nombre']}", txt,
+                             height=120, key=f"ci_msg_m_{i}")
+                if driver_phone:
+                    st.markdown(f"[Enviar a Motorista](https://wa.me/{driver_phone}?text={_q.quote(txt)})")
+    with cco:
+        st.markdown("**Mensajes – CHECK-OUT (mes)**")
+        if co_month_view.empty:
+            st.info("Sin transportes de check-out este mes.")
+        else:
+            for j, r in co_month_view.iterrows():
+                txt = _row_msg_month(r)
+                st.text_area(f"CO • {r['Fecha']} {r['Hora']} – {r['Apartamento']} – {r['Nombre']}", txt,
+                             height=120, key=f"co_msg_m_{j}")
+                if driver_phone:
+                    st.markdown(f"[Enviar a Motorista](https://wa.me/{driver_phone}?text={_q.quote(txt)})")
+
+    st.download_button("⬇️ Descargar CSV mensual (transportes)",
+                       data=month_view.sort_values(["Fecha","Hora","Acción","Apartamento"]).to_csv(index=False).encode("utf-8"),
+                       file_name=f"transportes_mes_{month_start_t.strftime('%Y-%m')}.csv",
+                       mime="text/csv")
+
+    # -------- 📅 Transportes HOY (detalle) --------
+    st.markdown("---")
+    with st.expander("📅 Transportes de HOY (detalle)"):
+        today_str = pd.Timestamp(work_date).strftime("%Y-%m-%d")
+        if has_ci:
+            t_ci_day = norm_m[(norm_m["checkin"]>=_day_bounds(work_date, day_start_t, day_end_t)[0]) &
+                              (norm_m["checkin"]<_day_bounds(work_date, day_start_t, day_end_t)[1]) &
+                              (norm_m["transport_ci"].apply(_is_si))].copy()
+        else:
+            t_ci_day = pd.DataFrame(columns=norm_m.columns)
+        if has_co:
+            t_co_day = norm_m[(norm_m["checkout"]>=_day_bounds(work_date, day_start_t, day_end_t)[0]) &
+                              (norm_m["checkout"]<_day_bounds(work_date, day_start_t, day_end_t)[1]) &
+                              (norm_m["transport_co"].apply(_is_si))].copy()
+        else:
+            t_co_day = pd.DataFrame(columns=norm_m.columns)
+
+        def _prep_view_day(df_in, kind):
+            if df_in.empty:
+                return pd.DataFrame(columns=["Hora","Acción","Apartamento","Nombre","Teléfono","Notas"])
+            if kind == "CHECK-IN":
+                df_in["Hora"]  = df_in.apply(lambda r: _hora_from_cols(r,"ci"), axis=1)
+            else:
+                df_in["Hora"]  = df_in.apply(lambda r: _hora_from_cols(r,"co"), axis=1)
+            df_in["Nombre"]   = df_in.apply(_pick_name, axis=1)
+            df_in["Teléfono"] = df_in.get("phone", pd.Series([""]*len(df_in))).apply(_clean_phone)
+            nota_tag = "Check-In " if kind=="CHECK-IN" else "Check-Out "
+            df_in["Notas"] = df_in.get("notes","").astype(str).fillna("") \
+                             + np.where(df_in["Hora"].astype(str).str.strip()!="", " | "+nota_tag+df_in["Hora"].astype(str), "")
+            out = df_in[["Hora","apartment","Nombre","Teléfono","Notas"]].rename(columns={"apartment":"Apartamento"})
+            out["Acción"] = kind
+            return out
+
+        ci_day_view = _prep_view_day(t_ci_day, "CHECK-IN")
+        co_day_view = _prep_view_day(t_co_day, "CHECK-OUT")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**CI de hoy (con transporte)**")
+            st.dataframe(ci_day_view.sort_values(["Hora","Apartamento"]) if not ci_day_view.empty else ci_day_view, use_container_width=True)
+        with col2:
+            st.markdown("**CO de hoy (con transporte)**")
+            st.dataframe(co_day_view.sort_values(["Hora","Apartamento"]) if not co_day_view.empty else co_day_view, use_container_width=True)
+
+        if not ci_day_view.empty or not co_day_view.empty:
+            lines = [f"Traslados de hoy — {pd.Timestamp(work_date).strftime('%d/%m/%Y')}"]
+            def _block_lines_day(df_in, tag):
+                out = []
+                for _, r in df_in.sort_values(["Hora","Apartamento"]).iterrows():
+                    out.append(f"• {r['Hora']} {tag} – {r['Apartamento']} – {r['Nombre']} – {r['Teléfono']} | {r['Notas']}")
+                return out
+            lines += (["", "CHECK-IN:"] + _block_lines_day(ci_day_view, "CHECK-IN")) if not ci_day_view.empty else []
+            lines += (["", "CHECK-OUT:"] + _block_lines_day(co_day_view, "CHECK-OUT")) if not co_day_view.empty else []
+            msg_hoy = "\n".join(lines)
+            st.text_area("Mensaje (hoy)", msg_hoy, height=160, key="msg_driver_hoy_t3")
+            driver_phone = re.sub(r"\D", "", (wa_driver or ""))
+            if driver_phone:
+                st.markdown(f"[Enviar por WhatsApp al **Motorista**](https://wa.me/{driver_phone}?text={_q.quote(msg_hoy)})")
+        else:
+            st.info("No hay transportes requeridos para hoy.")
