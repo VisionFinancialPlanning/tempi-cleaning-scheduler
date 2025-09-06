@@ -390,10 +390,16 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out[cols]
 
 # ==============================
-# EVENTOS / DÍA
+# EVENTOS / DÍA  (ACTUALIZADO)
 # ==============================
 def _events_por_apartamento(normalized: pd.DataFrame, day, day_start_t: time, day_end_t: time, extra_apartments=None):
+    """
+    Clasifica por día calendario local si hay CI/CO para cada apto
+    (sin importar la hora) y calcula la ventana de limpieza
+    recortada al horario laboral [start,end].
+    """
     start_of_day, end_of_day = _day_bounds(day, day_start_t, day_end_t)
+
     df = normalized.copy()
     df["checkin"]  = to_tz(df["checkin"])
     df["checkout"] = to_tz(df["checkout"])
@@ -401,55 +407,96 @@ def _events_por_apartamento(normalized: pd.DataFrame, day, day_start_t: time, da
     apts = sorted(df["apartment"].dropna().astype(str).unique().tolist())
     if extra_apartments:
         for x in extra_apartments:
-            if x not in apts: apts.append(x)
+            if x not in apts:
+                apts.append(x)
 
     out = {}
-    for apt in apts:
-        sub = df[df["apartment"].astype(str) == apt]
-        # HOY por rango horario (evita fallos por tz u horas en celda)
-        cis = [ts for ts in sub["checkin"].dropna()  if start_of_day <= ts < end_of_day]
-        cos = [ts for ts in sub["checkout"].dropna() if start_of_day <= ts < end_of_day]
-        cis = sorted([ts.tz_convert(TZ_NAME) for ts in cis])
-        cos = sorted([ts.tz_convert(TZ_NAME) for ts in cos])
+    work_date = pd.Timestamp(day).date()
 
-        pisas = sub[(sub["checkin"] < end_of_day) & (sub["checkout"] > start_of_day)]  # ocupación hoy
+    for apt in apts:
+        sub = df[df["apartment"].astype(str) == apt].copy()
+
+        # Eventos del día (por calendario, ignora horario)
+        cis_day = [ts for ts in list(sub["checkin"].dropna())  if ts.date() == work_date]
+        cos_day = [ts for ts in list(sub["checkout"].dropna()) if ts.date() == work_date]
+
+        # ¿Está ocupado en algún momento del horario laboral?
+        pisas = sub[(sub["checkin"] < end_of_day) & (sub["checkout"] > start_of_day)]
         ocupado = not pisas.empty
 
+        # Ventana disponible recortada al horario
         ventana = None
-        if cis and cos:
-            co = max(cos); ci = min(cis)
-            if ci > co: ventana = (co, ci, "turnover")
-        elif cos:
-            co = max(cos)
-            if end_of_day > co: ventana = (co, end_of_day, "solo checkout")
-        elif cis:
-            ci = min(cis)
-            if ci > start_of_day: ventana = (start_of_day, ci, "solo check-in")
+        if cis_day and cos_day:
+            # Turnover del día: última salida y primera entrada
+            co = max(cos_day); ci = min(cis_day)
+            win_start = max(co, start_of_day)
+            win_end   = min(ci, end_of_day)
+            if win_end > win_start:
+                ventana = (win_start, win_end, "turnover")
+        elif cos_day:
+            co = max(cos_day)
+            win_start = max(co, start_of_day)
+            win_end   = end_of_day
+            if win_end > win_start:
+                ventana = (win_start, win_end, "solo checkout")
+        elif cis_day:
+            ci = min(cis_day)
+            win_start = start_of_day
+            win_end   = min(ci, end_of_day)
+            if win_end > win_start:
+                ventana = (win_start, win_end, "solo check-in")
         elif not ocupado:
             ventana = (start_of_day, end_of_day, "vacio")
 
-        out[apt] = {"cis": cis, "cos": cos, "ocupado": ocupado, "ventana": ventana}
+        out[apt] = {"cis": cis_day, "cos": cos_day, "ocupado": ocupado, "ventana": ventana}
+
     return out
 
 def day_summary_collapsed_v2(normalized: pd.DataFrame, day, day_start_t: time, day_end_t: time, extra_apts=None) -> pd.DataFrame:
     ev = _events_por_apartamento(normalized, day, day_start_t, day_end_t, extra_apts)
     rows = []
+
+    def _fmt(ts_list):
+        if not ts_list:
+            return ""
+        hs = sorted({ts.strftime("%H:%M") for ts in ts_list})
+        return ", ".join(hs)
+
     for apt, d in ev.items():
         cis, cos, v = d["cis"], d["cos"], d["ventana"]
-        def _fmt(ts_list): return ", ".join(sorted({t.strftime("%H:%M") for t in ts_list})) if ts_list else ""
-        if v is None: continue
+        if v is None:
+            # ocupado todo el horario sin eventos del día → no se muestra
+            continue
         ini, fin, kind = v
         if kind == "turnover":
-            gap = round((fin - ini).total_seconds()/3600.0, 2)
-            rows.append({"apartment": apt, "tipo": "Turnover", "checkout_time": _fmt(cos), "checkin_time": _fmt(cis), "gap_hours": gap})
+            gap = round((fin - ini).total_seconds() / 3600.0, 2)
+            rows.append({
+                "apartment": apt, "tipo": "Turnover",
+                "checkout_time": _fmt(cos), "checkin_time": _fmt(cis),
+                "gap_hours": gap
+            })
         elif kind == "solo checkout":
-            rows.append({"apartment": apt, "tipo": "Solo Check-Out", "checkout_time": _fmt(cos), "checkin_time": "", "gap_hours": ""})
+            rows.append({
+                "apartment": apt, "tipo": "Solo Check-Out",
+                "checkout_time": _fmt(cos), "checkin_time": "",
+                "gap_hours": ""
+            })
         elif kind == "solo check-in":
-            rows.append({"apartment": apt, "tipo": "Solo Check-In", "checkout_time": "", "checkin_time": _fmt(cis), "gap_hours": ""})
+            rows.append({
+                "apartment": apt, "tipo": "Solo Check-In",
+                "checkout_time": "", "checkin_time": _fmt(cis),
+                "gap_hours": ""
+            })
         elif kind == "vacio":
-            rows.append({"apartment": apt, "tipo": "Vacío (día completo)", "checkout_time": "", "checkin_time": "", "gap_hours": 24})
+            rows.append({
+                "apartment": apt, "tipo": "Vacío (día completo)",
+                "checkout_time": "", "checkin_time": "",
+                "gap_hours": 24
+            })
+
     df = pd.DataFrame(rows)
-    if df.empty: return pd.DataFrame(columns=["apartment","tipo","checkout_time","checkin_time","gap_hours"])
+    if df.empty:
+        return pd.DataFrame(columns=["apartment","tipo","checkout_time","checkin_time","gap_hours"])
     df = df[df["apartment"].notna()].copy()
     df["__bali__"] = df["apartment"].astype(str).eq("BALI")
     df = df.sort_values(["__bali__", "tipo", "apartment"], ascending=[True, True, True]).drop(columns="__bali__")
@@ -469,7 +516,7 @@ def build_apartment_windows_v2(normalized: pd.DataFrame, day, day_start_t: time,
     out = out.sort_values(["__bali__", "apartment"]).drop(columns="__bali__").reset_index(drop=True)
     return out
 
-# ---- Estacionamientos activos de HOY (incluye check-ins antiguos) ----
+# ---- Estacionamientos activos de HOY (incluye check-ins antiguos)
 def active_parkings_today(normalized: pd.DataFrame, day, day_start_t: time, day_end_t: time) -> pd.DataFrame:
     start_of_day, end_of_day = _day_bounds(day, day_start_t, day_end_t)
     df = normalized.copy()
@@ -1057,7 +1104,7 @@ with tab2:
             x2 = pd.to_numeric(apt_group["nights"], errors="coerce").fillna(0)
             fig2, ax2 = plt.subplots(figsize=(11, max(3, 0.3*len(apt_group))))
             ax2.barh(y2, x2)
-            ax2.set_xlabel("Noches"); ax2.set_ylabel("Apartamento"); ax2.set_title("Noches del mes")
+            ax2.set_xlabel("Noches"); ax2.set_ylabel("Apartamento"); ax2.setTitle = "Noches del mes"
             st.pyplot(fig2)
 
         # Mix de canal
@@ -1080,7 +1127,7 @@ with tab2:
         avg_co = _avg_time(month_calc.loc[month_calc["checkout_in_month"]==1, "checkout_time_dt"])
         st.markdown(f"**Hora promedio** — Check-in: `{avg_ci or '—'}` • Check-out: `{avg_co or '—'}`")
 
-# ====== TAB 3: Transportes (MES COMPLETO + HOY) ======
+# ====== TAB 3: Transportes (MES COMPLETO + HOY)
 with tab3:
     st.header("🚐 Resumen de transportes (MES)")
 
@@ -1216,7 +1263,6 @@ with tab3:
     # -------- 📅 Transportes HOY (detalle) --------
     st.markdown("---")
     with st.expander("📅 Transportes de HOY (detalle)"):
-        today_str = pd.Timestamp(work_date).strftime("%Y-%m-%d")
         if has_ci:
             t_ci_day = norm_m[(norm_m["checkin"]>=_day_bounds(work_date, day_start_t, day_end_t)[0]) &
                               (norm_m["checkin"]<_day_bounds(work_date, day_start_t, day_end_t)[1]) &
@@ -1273,3 +1319,4 @@ with tab3:
                 st.markdown(f"[Enviar por WhatsApp al **Motorista**](https://wa.me/{driver_phone}?text={_q.quote(msg_hoy)})")
         else:
             st.info("No hay transportes requeridos para hoy.")
+
