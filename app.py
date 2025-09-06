@@ -353,6 +353,7 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "parking" in out.columns: out["parking_count"] = out["parking"].apply(_parse_parking_count)
     else: out["parking_count"] = 0
 
+    # CASH
     def _needs_cash(row):
         reason = []
         ch = str(row.get("channel","")).lower()
@@ -384,7 +385,7 @@ def parse_bookings_with_fixed_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out[cols]
 
 # ==============================
-# EVENTOS / DÍA  (ACTUALIZADO)
+# EVENTOS / DÍA
 # ==============================
 def _events_por_apartamento(normalized: pd.DataFrame, day, day_start_t: time, day_end_t: time, extra_apartments=None):
     start_of_day, end_of_day = _day_bounds(day, day_start_t, day_end_t)
@@ -674,7 +675,7 @@ with tab1:
         ] if c in prep_df.columns]
         st.dataframe(prep_df[cols_show], use_container_width=True)
 
-    # CASH hoy (por checkout)
+    # CASH (checkout de hoy)
     mask_cash = (normalized.get("cash_pickup", False) == True)
     df_cash = normalized.copy()
     df_cash["checkout"] = to_tz(df_cash["checkout"])
@@ -705,7 +706,7 @@ with tab1:
         st.dataframe(view_pk, use_container_width=True)
         apt_parking_count_map = active_pk.groupby("apartment")["parking_count"].sum().to_dict()
 
-    # 🚐 Transportes de HOY (rango horario)
+    # 🚐 Transportes de HOY
     st.subheader("🚐 Transportes de HOY (alerta rápida)")
     nm = normalized.copy()
     nm["checkin"]  = to_tz(nm["checkin"])
@@ -879,10 +880,45 @@ with tab1:
     if manual_plan.empty: st.info("Asigna empleado(s) e intervalos para ver el Gantt.")
     else: plot_gantt(manual_plan, title="Plan Manual de Limpieza (Gantt)", y_key="employee")
 
-    # --- 📲 WhatsApp para Empleadas (basado en la asignación manual)
+    # ====== Fallback: plan AUTOMÁTICO si no hay plan manual ======
+    # Construir trabajos a partir de ventanas del día
+    jobs_auto = []
+    if base_summary is not None and not base_summary.empty and not win_df.empty:
+        win_idx = { (r["apartment"]): (r["start"], r["end"], r["kind"]) for _, r in win_df.iterrows() }
+        for _, r in base_summary.iterrows():
+            apt   = r["apartment"]
+            tipo  = r["tipo"]
+            if apt not in win_idx: continue
+            w_start, w_end, w_kind = win_idx[apt]
+            dur = default_duration if w_kind in ("turnover","solo checkout") else mop_minutes  # solo check-in -> mopa
+            if (w_end - w_start).total_seconds() < 5*60:  # ventana inexistente
+                continue
+            jobs_auto.append({
+                "apartment": apt,
+                "unit_id": apt,
+                "guest_name": "",
+                "start_window": w_start,
+                "deadline": w_end,
+                "duration_min": int(dur)
+            })
+    jobs_auto_df = pd.DataFrame(jobs_auto)
+
+    # Crear timelines de empleadas
+    emp_timelines = [
+        EmployeeTimeline(emp1_name, e1_start, e1_end, e1_l1, e1_l2, work_date),
+        EmployeeTimeline(emp2_name, e2_start, e2_end, e2_l1, e2_l2, work_date),
+    ]
+    auto_plan, auto_unassigned = greedy_assign(jobs_auto_df, emp_timelines,
+                                               buffer_min=buffer_minutes,
+                                               travel_min=travel_minutes,
+                                               early_priority=early_priority)
+
+    # --- 📲 WhatsApp para Empleadas (manual si existe; si no, AUTOMÁTICO)
     st.subheader("📲 Mensajes de WhatsApp para empleadas")
-    if manual_plan.empty:
-        st.info("Asigna al menos una limpieza para generar los mensajes.")
+    plan_for_msgs = manual_plan if not manual_plan.empty else auto_plan
+
+    if plan_for_msgs.empty:
+        st.info("No hay asignaciones (manual o automática) para generar mensajes.")
     else:
         tipo_map = {r["apartment"]: r["tipo"] for _, r in base_summary.iterrows()}
         cash_map = {}
@@ -915,13 +951,14 @@ with tab1:
             emp2_name: (e2_l1.strftime("%H:%M"), e2_l2.strftime("%H:%M")),
         }
 
-        for emp in sorted(manual_plan["employee"].dropna().unique()):
-            emp_tasks = manual_plan[manual_plan["employee"] == emp].sort_values("start")
+        # Asegurar que el plan tenga la columna employee (en manual ya existe, en auto también)
+        for emp in sorted(plan_for_msgs["employee"].dropna().unique()):
+            emp_tasks = plan_for_msgs[plan_for_msgs["employee"] == emp].sort_values("start")
             if emp_tasks.empty: continue
             lines = [f"Hola {emp} 👋, este es tu plan de hoy {pd.Timestamp(work_date).strftime('%d/%m/%Y')}:"]
             for _, t in emp_tasks.iterrows():
                 apt  = t["apartment"]
-                tipo = tipo_map.get(apt, "")
+                tipo = tipo_map.get(apt, "Limpieza")
                 pk   = int(apt_parking_count_map.get(apt, 0))
                 park = "" if pk <= 0 else f" — Parking: x{pk}"
                 lines.append(f"• {fmt(t['start'])}–{fmt(t['end'])} — {apt} ({tipo}){park}{cash_str(apt)}")
@@ -934,11 +971,16 @@ with tab1:
             if phone:
                 st.markdown(f"[Enviar a {emp} por WhatsApp](https://wa.me/{phone}?text={_q.quote(msg)})")
 
+        # Mostrar si algo quedó sin asignar en el auto-plan
+        if manual_plan.empty and not auto_unassigned.empty:
+            st.warning("Tareas sin asignar (plan automático):")
+            st.dataframe(auto_unassigned[["apartment","start_window","deadline","duration_min"]])
+
     # ==== Descargas (Excel/PDF) ====
     st.subheader("📥 Descargar planificación del día (Excel / PDF)")
-    def _build_plan_export():
-        if manual_plan.empty: return pd.DataFrame()
-        df = manual_plan.copy()
+    def _build_plan_export(plan_df):
+        if plan_df.empty: return pd.DataFrame()
+        df = plan_df.copy()
         df = df.merge(base_summary[["apartment","tipo"]], on="apartment", how="left")
         df["Parking"] = df["apartment"].map(lambda a: ("Sí (x"+str(int(apt_parking_count_map.get(a,0)))+")") if apt_parking_count_map.get(a,0)>0 else "No")
         cash_map_local = {}
@@ -967,10 +1009,11 @@ with tab1:
         out_cols = ["employee","apartment","tipo","Inicio","Fin","duration_min","Parking","CASH"]
         df = df[out_cols].rename(columns={"employee":"Empleado","apartment":"Apartamento","tipo":"Tipo","duration_min":"Duración (min)"})
         return df.sort_values(["Inicio","Empleado","Apartamento"])
-    plan_export = _build_plan_export()
+
+    plan_export = _build_plan_export(manual_plan if not manual_plan.empty else auto_plan)
 
     if plan_export.empty:
-        st.info("Completa la tabla de asignación manual para habilitar descargas.")
+        st.info("Completa la tabla manual o deja que el auto-plan genere tareas para habilitar descargas.")
     else:
         try:
             excel_buffer = io.BytesIO()
@@ -1346,3 +1389,4 @@ with tab3:
                 st.markdown(f"[Enviar por WhatsApp al **Motorista**](https://wa.me/{driver_phone}?text={_q.quote(msg_hoy)})")
         else:
             st.info("No hay transportes requeridos para hoy.")
+
